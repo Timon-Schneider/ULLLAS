@@ -1,55 +1,46 @@
-# Prerequisites
-*.d
+# Build output
+build/
 
 # Object files
 *.o
-*.ko
 *.obj
-*.elf
+*.d
 
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
+# Binary outputs
 *.exe
-*.out
 *.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
 *.dSYM/
-*.su
-*.idb
 *.pdb
+*.ilk
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
 
-# debug information files
-*.dwo
+# macOS artifacts
+.DS_Store
+._*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Profiling / test artifacts
+capture.csv
+gmon.out
+perf.data*
+
+# Archives
+*.zip
+*.tar.gz
+*.7z
+
+# ASIO SDK (downloaded archive, not the source files)
+ASIO-SDK_*.zip
+ASIO-SDK_*/
