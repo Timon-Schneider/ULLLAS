@@ -2,6 +2,140 @@
 
 Point-to-multipoint uncompressed audio streaming over LAN with ASIO (Windows), CoreAudio (macOS), and JACK (Linux) backends. Designed for the lowest possible latency. Stream your microphone or game audio from one PC to another, or broadcast to multiple receivers.
 
+## Download and Run
+
+Pre-built binaries are available on the **[Releases](https://github.com/Timon-Schneider/ULLLAS/releases)** page.
+
+### Windows
+
+1. Download `ulllas.exe`
+2. Open a terminal (Command Prompt or PowerShell) in the download folder
+3. Run:
+   ```
+   .\ulllas.exe send --list-devices
+   ```
+
+### macOS (Intel)
+
+> **Note:** The app is **not signed**, so macOS will block it on first launch.
+
+1. Download the `.dmg` file
+2. Open the `.dmg` and drag `ulllas.app` to your Applications folder
+3. **First launch only:** Right-click (or Ctrl+click) the app in Applications and select **Open**, then click **Open** in the dialog
+4. After that, you can launch the app normally
+5. Run from the command line:
+   ```
+   /Applications/ulllas.app/Contents/MacOS/ulllas send --list-devices
+   ```
+
+### Linux
+
+1. Download the `ulllas` binary (no file extension)
+2. Make it executable:
+   ```
+   chmod +x ulllas
+   ```
+3. Run:
+   ```
+   ./ulllas send --list-devices
+   ```
+
+---
+
+## Usage
+
+### List available audio devices
+
+```bash
+ulllas send --list-devices
+ulllas send --backend jack --list-devices
+```
+
+### Sender (capture audio and stream to network)
+
+```bash
+# Default multicast (group 239.77.77.77, port 9000) — sender and receiver auto-config
+ulllas send --in-channels 0,1
+ulllas recv --out-channels 0,1
+
+# Custom multicast group
+ulllas send --in-channels 0,1 --target 239.77.77.77
+ulllas recv --out-channels 0,1 --target 239.77.77.77
+
+# Custom port (both sides must match)
+ulllas send --in-channels 0,1 --port 9001
+ulllas recv --out-channels 0,1 --port 9001
+
+# Single channel (mono), specific device, lower latency
+ulllas send --device "Focusrite" --in-channels 0 --buffer 64
+
+# Unicast mode (point-to-point over specific interface)
+ulllas send --in-channels 0,1 --target 192.168.1.100 --unicast --iface 192.168.1.10
+```
+
+### Receiver (receive network audio and play locally)
+
+```bash
+# Default multicast receive (auto-joins group 239.77.77.77, port 9000)
+ulllas recv --out-channels 0,1
+
+# Custom multicast group — must match the sender's --target
+ulllas recv --out-channels 0,1 --target 239.77.77.77
+
+# Custom channel routing: network stream ch0 → speaker ch4, stream ch1 → speaker ch5
+ulllas recv --out-channels 4,5
+
+# More jitter buffer for unreliable networks
+ulllas recv --out-channels 0,1 --jitter 4
+```
+
+### Multi-receiver (broadcast)
+
+Just run the receiver on multiple PCs — the sender uses multicast by default, so one send reaches all receivers. Both sides default to group 239.77.77.77 port 9000.
+
+```
+PC1: ulllas send --in-channels 0,1
+PC2: ulllas recv --out-channels 0,1
+PC3: ulllas recv --out-channels 0,1
+```
+
+### Full-duplex (send and receive simultaneously)
+
+Run two instances:
+
+```bash
+# PC1: send mic, receive remote audio
+ulllas send --in-channels 0,1 --target 239.77.77.77 --port 9000
+ulllas recv --out-channels 0,1 --port 9001
+
+# PC2: send mic, receive remote audio
+ulllas send --in-channels 0,1 --target 239.77.77.77 --port 9001
+ulllas recv --out-channels 0,1 --port 9000
+```
+
+### All options
+
+| Flag | Mode | Default | Description |
+|---|---|---|---|
+| `--backend <name>` | both | auto | Audio backend: `coreaudio` (macOS), `asio` (Win), `jack` (Linux) |
+| `--device <name>` | both | auto | Audio device name substring match |
+| `--in-channels <a,b,…>` | send | `0,1` | ASIO/JACK/CoreAudio input channel indices to capture |
+| `--out-channels <a,b,…>` | recv | `0,1` | ASIO/JACK/CoreAudio output channel indices to play to |
+| `--sample-rate <hz>` | both | `48000` | Sample rate (8000–384000). Ignored on JACK — server sets rate |
+| `--bit-depth <bits>` | both | `24` | Network payload bit depth: `16`, `24`, or `32` |
+| `--buffer <samples>` | both | `128` | Audio buffer size (8–4096). Lower = less latency. On macOS the device may round to nearest supported size |
+| `--target <ip>` | both | `239.77.77.77` | Target IP (sender) or multicast group to join (receiver) |
+| `--bind <ip>` | recv | `0.0.0.0` | IP to bind the receiving socket to |
+| `--port <port>` | both | `9000` | UDP port to send to / listen on |
+| `--iface <ip>` | send | `0.0.0.0` | Outbound interface IP for multicast |
+| `--unicast` | both | off | Use unicast instead of multicast |
+| `--jitter <packets>` | recv | `2` | Jitter buffer size in packets (1–8) |
+| `--list-devices` | both | — | List audio devices and exit |
+| `--verbose` | both | off | Show peak levels in status line |
+| `--help` / `-h` | both | — | Print usage |
+
+---
+
 ## Features
 
 - **ASIO backend** (Windows) — bypasses the Windows audio stack entirely, ~1–3ms capture/playback latency
@@ -249,100 +383,6 @@ Or from macOS as sender:
 # On a Windows or Linux PC (receiver):
 ulllas recv --out-channels 0,1
 ```
-
----
-
-## Usage
-
-### List available audio devices
-
-```bash
-ulllas send --list-devices
-ulllas send --backend jack --list-devices
-```
-
-### Sender (capture audio and stream to network)
-
-```bash
-# Default multicast (group 239.77.77.77, port 9000) — sender and receiver auto-config
-ulllas send --in-channels 0,1
-ulllas recv --out-channels 0,1
-
-# Custom multicast group
-ulllas send --in-channels 0,1 --target 239.77.77.77
-ulllas recv --out-channels 0,1 --target 239.77.77.77
-
-# Custom port (both sides must match)
-ulllas send --in-channels 0,1 --port 9001
-ulllas recv --out-channels 0,1 --port 9001
-
-# Single channel (mono), specific device, lower latency
-ulllas send --device "Focusrite" --in-channels 0 --buffer 64
-
-# Unicast mode (point-to-point over specific interface)
-ulllas send --in-channels 0,1 --target 192.168.1.100 --unicast --iface 192.168.1.10
-```
-
-### Receiver (receive network audio and play locally)
-
-```bash
-# Default multicast receive (auto-joins group 239.77.77.77, port 9000)
-ulllas recv --out-channels 0,1
-
-# Custom multicast group — must match the sender's --target
-ulllas recv --out-channels 0,1 --target 239.77.77.77
-
-# Custom channel routing: network stream ch0 → speaker ch4, stream ch1 → speaker ch5
-ulllas recv --out-channels 4,5
-
-# More jitter buffer for unreliable networks
-ulllas recv --out-channels 0,1 --jitter 4
-```
-
-### Multi-receiver (broadcast)
-
-Just run the receiver on multiple PCs — the sender uses multicast by default, so one send reaches all receivers. Both sides default to group 239.77.77.77 port 9000.
-
-```
-PC1: ulllas send --in-channels 0,1
-PC2: ulllas recv --out-channels 0,1
-PC3: ulllas recv --out-channels 0,1
-```
-
-### Full-duplex (send and receive simultaneously)
-
-Run two instances:
-
-```bash
-# PC1: send mic, receive remote audio
-ulllas send --in-channels 0,1 --target 239.77.77.77 --port 9000
-ulllas recv --out-channels 0,1 --port 9001
-
-# PC2: send mic, receive remote audio
-ulllas send --in-channels 0,1 --target 239.77.77.77 --port 9001
-ulllas recv --out-channels 0,1 --port 9000
-```
-
-### All options
-
-| Flag | Mode | Default | Description |
-|---|---|---|---|---|
-| `--backend <name>` | both | auto | Audio backend: `coreaudio` (macOS), `asio` (Win), `jack` (Linux) |
-| `--device <name>` | both | auto | Audio device name substring match |
-| `--in-channels <a,b,…>` | send | `0,1` | ASIO/JACK/CoreAudio input channel indices to capture |
-| `--out-channels <a,b,…>` | recv | `0,1` | ASIO/JACK/CoreAudio output channel indices to play to |
-| `--sample-rate <hz>` | both | `48000` | Sample rate (8000–384000). Ignored on JACK — server sets rate |
-| `--bit-depth <bits>` | both | `24` | Network payload bit depth: `16`, `24`, or `32` |
-| `--buffer <samples>` | both | `128` | Audio buffer size (8–4096). Lower = less latency. On macOS the device may round to nearest supported size |
-| `--target <ip>` | both | `239.77.77.77` | Target IP (sender) or multicast group to join (receiver) |
-| `--bind <ip>` | recv | `0.0.0.0` | IP to bind the receiving socket to |
-| `--port <port>` | both | `9000` | UDP port to send to / listen on |
-| `--iface <ip>` | send | `0.0.0.0` | Outbound interface IP for multicast |
-| `--unicast` | both | off | Use unicast instead of multicast |
-| `--jitter <packets>` | recv | `2` | Jitter buffer size in packets (1–8) |
-| `--list-devices` | both | — | List audio devices and exit |
-| `--verbose` | both | off | Show peak levels in status line |
-| `--help` / `-h` | both | — | Print usage |
 
 ---
 
