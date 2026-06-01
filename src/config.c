@@ -5,21 +5,26 @@
 
 #ifdef _WIN32
 #define strcasecmp _stricmp
+#define ulllas_strtok strtok_s
 #else
 #include <strings.h>
+#define ulllas_strtok strtok_r
 #endif
 
 static void config_set_defaults(Config *cfg) {
     memset(cfg, 0, sizeof(Config));
-    cfg->is_sender        = false;
-    cfg->sample_rate      = 48000;
-    cfg->bit_depth        = 24;
-    cfg->buffer_size      = 128;
-    cfg->port             = 9000;
-    cfg->use_multicast    = true;
-    cfg->jitter_packets   = 2;
-    cfg->list_devices     = false;
-    cfg->verbose          = false;
+    cfg->is_sender      = false;
+    cfg->sample_rate    = 48000;
+    cfg->bit_depth      = 24;
+    cfg->buffer_size    = 128;
+    cfg->port           = 9000;
+    cfg->use_multicast  = true;
+    cfg->jitter_packets = 2;
+    cfg->plc            = false;
+    cfg->fec_group_size = 0;
+    cfg->drift_comp     = false;
+    cfg->list_devices   = false;
+    cfg->verbose        = false;
 #ifdef __APPLE__
     strncpy(cfg->backend, "coreaudio", sizeof(cfg->backend) - 1);
 #elif defined(__linux__)
@@ -34,13 +39,14 @@ static void config_set_defaults(Config *cfg) {
 }
 
 static int parse_channels(const char *s, int *map, int max_ch) {
-    int count = 0;
-    char *copy = strdup(s);
+    int   count = 0;
+    char *copy  = strdup(s);
     if (!copy) return 0;
-    char *token = strtok(copy, ",");
+    char *saveptr = NULL;
+    char *token   = ulllas_strtok(copy, ",", &saveptr);
     while (token && count < max_ch) {
         map[count++] = atoi(token);
-        token = strtok(NULL, ",");
+        token        = ulllas_strtok(NULL, ",", &saveptr);
     }
     free(copy);
     return count;
@@ -48,43 +54,52 @@ static int parse_channels(const char *s, int *map, int max_ch) {
 
 void config_print_usage(const char *prog) {
     fprintf(stderr,
-        "ULLLAS - Ultra Low Latency LAN Audio Streamer v1.0.0\n\n"
-        "Usage: %s <mode> [options]\n\n"
-        "Modes:\n"
-        "  send     Capture local audio and stream to network\n"
-        "  recv     Receive network audio and play locally\n\n"
-        "Options:\n"
-        "  --backend <name>       Audio backend: coreaudio (macOS), asio (Windows), jack (Linux)\n"
-        "                          [default: auto (platform-dependent)]\n"
-        "  --device <name>        Audio device name (list with --list-devices)\n"
-        "  --in-channels <a,b,..>  Input channel indices to capture (sender)\n"
-        "  --out-channels <a,b,..> Output channel indices to play to (receiver)\n"
-        "  --sample-rate <hz>     Sample rate [default: 48000] (ignored on JACK)\n"
-        "  --bit-depth <bits>     Bit depth: 16, 24, or 32 [default: 24]\n"
-        "  --buffer <samples>     Audio buffer size in samples [default: 128]\n"
-        "  --target <ip>           Target IP address (sender) or multicast group (receiver)\n"
-        "                          [default: 239.77.77.77]\n"
-        "  --bind <ip>            Bind address for receiver [default: 0.0.0.0]\n"
-        "  --port <port>          UDP port for send and receive [default: 9000]\n"
-        "  --iface <ip>           Outbound interface address for multicast [default: 0.0.0.0]\n"
-        "  --unicast              Use unicast instead of multicast\n"
-        "                          (sender: required when --target is not a multicast IP)\n"
-        "  --jitter <packets>     Jitter buffer size in packets (receiver, 1-8) [default: 2]\n"
-        "  --list-devices         List available audio devices and exit\n"
-        "  --verbose              Verbose output (peak levels in status)\n\n"
-        "Multicast (default): one sender reaches all receivers on the LAN.\n"
-        "  Sender:   uillas send --in-channels 0,1\n"
-        "  Receiver: uillas recv --out-channels 0,1\n"
-        "  Both default to multicast group 239.77.77.77 port 9000 — just run and go.\n\n"
-        "Unicast: point-to-point between two machines with known IP addresses.\n"
-        "  Sender:   uillas send --in-channels 0,1 --target 192.168.1.100 --unicast\n"
-        "  Receiver: uillas recv --out-channels 0,1\n"
-        "  Use --unicast on the sender when the target is not in the multicast range.\n\n"
-        "Examples:\n"
-        "  %s send --backend asio --in-channels 0,1\n"
-        "  %s recv --backend asio --out-channels 0,1\n"
-        "  %s send --backend jack --in-channels 0,1 --target 192.168.1.100 --unicast\n",
-        prog, prog, prog, prog);
+            "ULLLAS - Ultra Low Latency LAN Audio Streamer v2.0.0\n\n"
+            "Usage: %s <mode> [options]\n\n"
+            "Modes:\n"
+            "  send     Capture local audio and stream to network\n"
+            "  recv     Receive network audio and play locally\n\n"
+            "Options:\n"
+            "  --backend <name>       Audio backend: coreaudio (macOS), asio (Windows), jack (Linux)\n"
+            "                          [default: auto (platform-dependent)]\n"
+            "  --device <name>        Audio device name (list with --list-devices)\n"
+            "  --in-channels <a,b,..>  Input channel indices to capture (sender)\n"
+            "  --out-channels <a,b,..> Output channel indices to play to (receiver)\n"
+            "  --sample-rate <hz>     Sample rate [default: 48000] (ignored on JACK)\n"
+            "  --bit-depth <bits>     Bit depth: 16, 24, or 32 [default: 24]\n"
+            "  --buffer <samples>     Audio buffer size in samples [default: 128]\n"
+            "  --target <ip>           Target IP address (sender) or multicast group (receiver)\n"
+            "                          [default: 239.77.77.77]\n"
+            "  --bind <ip>            Bind address for receiver [default: 0.0.0.0]\n"
+            "  --port <port>          UDP port for send and receive [default: 9000]\n"
+            "  --iface <ip>           Multicast interface IP. Sender: outbound iface; receiver: NIC to\n"
+            "                          join group on [default: 0.0.0.0]\n"
+            "  --unicast              Use unicast instead of multicast\n"
+            "                          (sender: required when --target is not a multicast IP)\n"
+            "  --jitter <packets>     Jitter buffer size in packets (receiver, 1-8) [default: 2]\n"
+            "  --plc                  Enable packet loss concealment (receiver). Holds the last frame\n"
+            "                          briefly and fades to silence on loss. Opt-in.\n"
+            "  --fec <N>              Enable XOR forward error correction. Sender emits a parity\n"
+            "                          packet every N data packets. Receiver delays playback by\n"
+            "                          one FEC group (N+1 packets) to enable recovery. Adds latency.\n"
+            "                          N in [2..16].\n"
+            "  --drift-comp           Enable clock-drift compensation (receiver). Drops or duplicates\n"
+            "                          single frames occasionally to track the sender's clock.\n"
+            "  --list-devices         List available audio devices and exit\n"
+            "  --verbose              Verbose output (peak levels in status)\n\n"
+            "Multicast (default): one sender reaches all receivers on the LAN.\n"
+            "  Sender:   ulllas send --in-channels 0,1\n"
+            "  Receiver: ulllas recv --out-channels 0,1\n"
+            "  Both default to multicast group 239.77.77.77 port 9000 - just run and go.\n\n"
+            "Unicast: point-to-point between two machines with known IP addresses.\n"
+            "  Sender:   ulllas send --in-channels 0,1 --target 192.168.1.100 --unicast\n"
+            "  Receiver: ulllas recv --out-channels 0,1\n"
+            "  Use --unicast on the sender when the target is not in the multicast range.\n\n"
+            "Examples:\n"
+            "  %s send --backend asio --in-channels 0,1\n"
+            "  %s recv --backend asio --out-channels 0,1 --plc\n"
+            "  %s send --backend jack --in-channels 0,1 --target 192.168.1.100 --unicast --fec 4\n",
+            prog, prog, prog, prog);
 }
 
 int config_parse(Config *cfg, int argc, char **argv) {
@@ -116,10 +131,10 @@ int config_parse(Config *cfg, int argc, char **argv) {
             strncpy(cfg->device_name, argv[++i], sizeof(cfg->device_name) - 1);
         } else if (strcmp(argv[i], "--in-channels") == 0 && i + 1 < argc) {
             cfg->in_channel_count = parse_channels(argv[++i], cfg->in_channel_map, MAX_CHANNELS);
-            in_set = 1;
+            in_set                = 1;
         } else if (strcmp(argv[i], "--out-channels") == 0 && i + 1 < argc) {
             cfg->out_channel_count = parse_channels(argv[++i], cfg->out_channel_map, MAX_CHANNELS);
-            out_set = 1;
+            out_set                = 1;
         } else if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc) {
             cfg->sample_rate = (unsigned int)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bit-depth") == 0 && i + 1 < argc) {
@@ -127,13 +142,12 @@ int config_parse(Config *cfg, int argc, char **argv) {
         } else if (strcmp(argv[i], "--buffer") == 0 && i + 1 < argc) {
             cfg->buffer_size = (unsigned int)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
-            const char *val = argv[++i];
+            const char *val   = argv[++i];
             const char *colon = strrchr(val, ':');
             if (colon) {
                 fprintf(stderr, "Warning: port in --target is ignored, use --port instead\n");
                 size_t ip_len = (size_t)(colon - val);
-                if (ip_len >= sizeof(cfg->target_addr))
-                    ip_len = sizeof(cfg->target_addr) - 1;
+                if (ip_len >= sizeof(cfg->target_addr)) ip_len = sizeof(cfg->target_addr) - 1;
                 memcpy(cfg->target_addr, val, ip_len);
                 cfg->target_addr[ip_len] = '\0';
             } else {
@@ -149,6 +163,12 @@ int config_parse(Config *cfg, int argc, char **argv) {
             cfg->use_multicast = false;
         } else if (strcmp(argv[i], "--jitter") == 0 && i + 1 < argc) {
             cfg->jitter_packets = (unsigned int)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--plc") == 0) {
+            cfg->plc = true;
+        } else if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) {
+            cfg->fec_group_size = (unsigned int)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--drift-comp") == 0) {
+            cfg->drift_comp = true;
         } else if (strcmp(argv[i], "--list-devices") == 0) {
             cfg->list_devices = true;
         } else if (strcmp(argv[i], "--verbose") == 0) {
@@ -183,6 +203,11 @@ int config_parse(Config *cfg, int argc, char **argv) {
         return -1;
     }
 
+    if (cfg->fec_group_size != 0 && (cfg->fec_group_size < 2 || cfg->fec_group_size > 16)) {
+        fprintf(stderr, "Invalid --fec: %u (must be 0 or in [2..16])\n", cfg->fec_group_size);
+        return -1;
+    }
+
     if (cfg->target_addr[0] == '\0') {
         strncpy(cfg->target_addr, "239.77.77.77", sizeof(cfg->target_addr) - 1);
     }
@@ -198,16 +223,23 @@ int config_parse(Config *cfg, int argc, char **argv) {
         fprintf(stderr, "Warning: --in-channels has no effect in recv mode (use --out-channels)\n");
     }
 
+    if (cfg->is_sender && cfg->drift_comp) {
+        fprintf(stderr, "Warning: --drift-comp only affects the receiver, ignoring on sender\n");
+    }
+    if (cfg->is_sender && cfg->plc) {
+        fprintf(stderr, "Warning: --plc only affects the receiver, ignoring on sender\n");
+    }
+
     if (!cfg->list_devices) {
         if (cfg->is_sender && cfg->in_channel_count == 0) {
             cfg->in_channel_map[0] = 0;
             cfg->in_channel_map[1] = 1;
-            cfg->in_channel_count = 2;
+            cfg->in_channel_count  = 2;
         }
         if (!cfg->is_sender && cfg->out_channel_count == 0) {
             cfg->out_channel_map[0] = 0;
             cfg->out_channel_map[1] = 1;
-            cfg->out_channel_count = 2;
+            cfg->out_channel_count  = 2;
         }
     }
 

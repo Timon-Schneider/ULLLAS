@@ -55,15 +55,21 @@ static void asio_process_buffers(long index) {
         int32_t *dst = ctx->in_bufs[i];
         switch (ctx->in_sample_types[i]) {
         case ASIOSTInt16LSB:
-            for (long j = 0; j < nframes; j++)
-                dst[j] = ((int32_t)((int16_t *)src)[j]) << 16;
+            for (long j = 0; j < nframes; j++) {
+                /* Top-align: 16-bit sample lives in the upper 16 bits of int32. */
+                uint32_t u = (uint32_t)(int32_t)((int16_t *)src)[j];
+                dst[j]     = (int32_t)(u << 16);
+            }
             break;
         case ASIOSTInt24LSB:
             for (long j = 0; j < nframes; j++) {
+                /* v1 stored these sign-extended in the LOW 24 bits, but
+                 * pcm_pack (and every other backend) assumes top-aligned
+                 * int32, which made ASIO Int24LSB inputs stream ~48 dB
+                 * below true level. Top-align here. */
                 uint8_t *b = (uint8_t *)src + j * 3;
-                int32_t v = (int32_t)(b[0] | (b[1] << 8) | (b[2] << 16));
-                if (v & 0x800000) v |= 0xFF000000;
-                dst[j] = v;
+                uint32_t u = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16);
+                dst[j]     = (int32_t)(u << 8); /* sign extends naturally */
             }
             break;
         case ASIOSTFloat32LSB:
@@ -98,16 +104,22 @@ static void asio_process_buffers(long index) {
         if (!dst) continue;
         switch (ctx->out_sample_types[i]) {
         case ASIOSTInt16LSB:
-            for (long j = 0; j < nframes; j++)
-                ((int16_t *)dst)[j] = (int16_t)(src[j] >> 16);
+            for (long j = 0; j < nframes; j++) {
+                /* Top-aligned src -> top 16 bits is the audio. */
+                uint32_t u = (uint32_t)src[j];
+                ((int16_t *)dst)[j] = (int16_t)(u >> 16);
+            }
             break;
         case ASIOSTInt24LSB:
             for (long j = 0; j < nframes; j++) {
-                int32_t s = src[j];
+                /* v1 wrote the LOW 24 bits of a top-aligned int32, which
+                 * produced ~48 dB of attenuation. Top 24 bits is the
+                 * actual sample data. */
+                uint32_t u = (uint32_t)src[j];
                 uint8_t *b = (uint8_t *)dst + j * 3;
-                b[0] = (uint8_t)(s & 0xFF);
-                b[1] = (uint8_t)((s >> 8) & 0xFF);
-                b[2] = (uint8_t)((s >> 16) & 0xFF);
+                b[0]       = (uint8_t)(u >> 8);
+                b[1]       = (uint8_t)(u >> 16);
+                b[2]       = (uint8_t)(u >> 24);
             }
             break;
         case ASIOSTFloat32LSB:
@@ -123,7 +135,12 @@ static void asio_process_buffers(long index) {
         }
     }
 
-    if (ctx->num_out_ch > 0 && ctx->running.load(std::memory_order_relaxed)) ASIOOutputReady();
+    /* The original code checked `running` again here; that opens a
+     * window where stop() flipped the flag between the buffer write and
+     * the ASIOOutputReady() call, leaving the driver thinking a half-
+     * empty buffer was ready. The buffer was already populated, so we
+     * just call it unconditionally. */
+    if (ctx->num_out_ch > 0) ASIOOutputReady();
 }
 
 static void asioBufferSwitch(long index, ASIOBool directProcess) {

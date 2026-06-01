@@ -129,10 +129,15 @@ ulllas recv --out-channels 0,1 --port 9000
 | `--port <port>` | both | `9000` | UDP port to send to / listen on |
 | `--iface <ip>` | send | `0.0.0.0` | Outbound interface IP for multicast |
 | `--unicast` | both | off | Use unicast instead of multicast |
-| `--jitter <packets>` | recv | `2` | Jitter buffer size in packets (1–8) |
+| `--jitter <packets>` | recv | `2` | Static jitter buffer size in packets (1–8). Always honored; no adaptive sizing |
+| `--plc` | recv | off | Packet loss concealment: hold the last frame briefly then fade to silence on loss. No added latency |
+| `--fec <N>` | both | off | XOR forward error correction: send a parity packet every `N` data packets. Receiver delays playback by one FEC group (`N+1` packets) to enable recovery. `N` in `[2..16]` |
+| `--drift-comp` | recv | off | Drop or duplicate one frame occasionally to track the sender's clock over long sessions |
 | `--list-devices` | both | — | List audio devices and exit |
-| `--verbose` | both | off | Show peak levels in status line |
+| `--verbose` | both | off | Show peak levels and full stats in status line |
 | `--help` / `-h` | both | — | Print usage |
+
+> **Note (v2):** the on-the-wire protocol changed in v2 (new magic `ULLB`, larger header, exact sample-rate field, FEC fields). v1 senders cannot talk to v2 receivers or vice versa. Upgrade both ends.
 
 ---
 

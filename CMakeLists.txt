@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(ulllas VERSION 1.0.0 LANGUAGES C CXX)
+project(ulllas VERSION 2.0.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -14,7 +14,9 @@ set(SOURCES
     src/pcm_proto.c
     src/udp_tx.c
     src/udp_rx.c
-    src/cpp_init.cpp
+    src/plc.c
+    src/fec.c
+    src/rt_thread.c
 )
 
 set(HEADERS
@@ -22,7 +24,10 @@ set(HEADERS
     src/config.h
     src/network.h
     src/pcm_proto.h
+    src/plc.h
+    src/fec.h
     src/ringbuffer.h
+    src/rt_thread.h
     src/asio_backend.h
     src/jack_backend.h
 )
@@ -36,36 +41,37 @@ if(WIN32)
         message(WARNING "ASIO SDK not found in asio/ directory. Place asio.h, asiodrivers.h, asiodrivers.cpp, asiosys.h, asio.cpp there for Windows ASIO support.")
         add_compile_definitions(NO_ASIO)
     endif()
-    elseif(APPLE)
-        list(APPEND SOURCES src/coreaudio_backend.cpp)
-        add_compile_definitions(HAS_COREAUDIO)
-        message(STATUS "CoreAudio support enabled (macOS)")
+elseif(APPLE)
+    list(APPEND SOURCES src/coreaudio_backend.cpp)
+    list(APPEND HEADERS src/coreaudio_backend.h)
+    add_compile_definitions(HAS_COREAUDIO)
+    message(STATUS "CoreAudio support enabled (macOS)")
 
-        find_package(PkgConfig)
-        if(PkgConfig_FOUND)
-            pkg_check_modules(JACK jack)
-        endif()
-        if(JACK_FOUND)
-            list(APPEND SOURCES src/jack_backend.cpp)
-            add_compile_definitions(HAS_JACK)
-            message(STATUS "JACK found, building with JACK support")
-        else()
-            add_compile_definitions(NO_JACK)
-        endif()
-    else()
-        find_package(PkgConfig)
-        if(PkgConfig_FOUND)
-            pkg_check_modules(JACK jack)
-        endif()
-        if(JACK_FOUND)
-            list(APPEND SOURCES src/jack_backend.cpp)
-            add_compile_definitions(HAS_JACK)
-            message(STATUS "JACK found, building with JACK support")
-        else()
-            message(WARNING "JACK development headers not found. Install libjack-dev or jack2-devel for Linux JACK support.")
-            add_compile_definitions(NO_JACK)
-        endif()
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(JACK jack)
     endif()
+    if(JACK_FOUND)
+        list(APPEND SOURCES src/jack_backend.cpp)
+        add_compile_definitions(HAS_JACK)
+        message(STATUS "JACK found, building with JACK support")
+    else()
+        add_compile_definitions(NO_JACK)
+    endif()
+else()
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(JACK jack)
+    endif()
+    if(JACK_FOUND)
+        list(APPEND SOURCES src/jack_backend.cpp)
+        add_compile_definitions(HAS_JACK)
+        message(STATUS "JACK found, building with JACK support")
+    else()
+        message(WARNING "JACK development headers not found. Install libjack-dev or jack2-devel for Linux JACK support.")
+        add_compile_definitions(NO_JACK)
+    endif()
+endif()
 
 find_package(Threads)
 
@@ -79,39 +85,42 @@ if(APPLE)
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Info.plist"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.ulllas.audio"
         MACOSX_BUNDLE_BUNDLE_NAME "ULLLAS"
-        MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION "2.0.0"
     )
 endif()
 
 if(WIN32)
     target_include_directories(ulllas PRIVATE asio)
+    # iphlpapi is pulled in by ws2tcpip.h indirectly on some toolchains.
     target_link_libraries(ulllas PRIVATE ws2_32 winmm ole32)
-    elseif(APPLE)
-        find_library(COREAUDIO_LIB CoreAudio REQUIRED)
-        find_library(AUDIOTOOLBOX_LIB AudioToolbox REQUIRED)
-        find_library(COREFOUNDATION_LIB CoreFoundation REQUIRED)
-        target_link_libraries(ulllas PRIVATE
-            ${COREAUDIO_LIB}
-            ${AUDIOTOOLBOX_LIB}
-            ${COREFOUNDATION_LIB}
-        )
-        if(Threads_FOUND)
-            target_link_libraries(ulllas PRIVATE Threads::Threads)
-        endif()
-        if(JACK_FOUND)
-            target_include_directories(ulllas PRIVATE ${JACK_INCLUDE_DIRS})
-            target_link_libraries(ulllas PRIVATE ${JACK_LIBRARIES})
-        endif()
-    else()
-        target_link_libraries(ulllas PRIVATE m)
-        if(Threads_FOUND)
-            target_link_libraries(ulllas PRIVATE Threads::Threads)
-        endif()
-        if(JACK_FOUND)
-            target_include_directories(ulllas PRIVATE ${JACK_INCLUDE_DIRS})
-            target_link_libraries(ulllas PRIVATE ${JACK_LIBRARIES})
-        endif()
+elseif(APPLE)
+    find_library(COREAUDIO_LIB CoreAudio REQUIRED)
+    find_library(AUDIOTOOLBOX_LIB AudioToolbox REQUIRED)
+    find_library(COREFOUNDATION_LIB CoreFoundation REQUIRED)
+    target_link_libraries(ulllas PRIVATE
+        ${COREAUDIO_LIB}
+        ${AUDIOTOOLBOX_LIB}
+        ${COREFOUNDATION_LIB}
+    )
+    if(Threads_FOUND)
+        target_link_libraries(ulllas PRIVATE Threads::Threads)
     endif()
+    if(JACK_FOUND)
+        target_include_directories(ulllas PRIVATE ${JACK_INCLUDE_DIRS})
+        target_link_libraries(ulllas PRIVATE ${JACK_LIBRARIES})
+    endif()
+else()
+    # _GNU_SOURCE for pthread_setschedparam, strcasestr, mlockall, etc.
+    target_compile_definitions(ulllas PRIVATE _GNU_SOURCE)
+    target_link_libraries(ulllas PRIVATE m)
+    if(Threads_FOUND)
+        target_link_libraries(ulllas PRIVATE Threads::Threads)
+    endif()
+    if(JACK_FOUND)
+        target_include_directories(ulllas PRIVATE ${JACK_INCLUDE_DIRS})
+        target_link_libraries(ulllas PRIVATE ${JACK_LIBRARIES})
+    endif()
+endif()
 
 if(MSVC)
     target_compile_options(ulllas PRIVATE /W4 /O2)

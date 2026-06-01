@@ -8,6 +8,12 @@
 #include <string.h>
 #include <vector>
 
+/*
+ * JACK's process callback is hard real-time: no allocation, no syscalls,
+ * no locks. v1 called std::vector::assign/resize every callback, which
+ * allocates the first time and on any size change. v2 pre-allocates all
+ * scratch arrays at init and just memcpy/memset in the callback.
+ */
 struct JackContext {
     jack_client_t *client;
     std::vector<jack_port_t *> in_ports;
@@ -20,10 +26,11 @@ struct JackContext {
     bool auto_connect;
     bool active;
 
-    std::vector<int32_t> in_scratch;
-    std::vector<int32_t> out_scratch;
-    std::vector<int32_t *> in_s32;
-    std::vector<int32_t *> out_s32;
+    /* Sized once in init; never resized inside the callback. */
+    int32_t *in_scratch;     /* num_in_ch * buffer_size */
+    int32_t *out_scratch;    /* num_out_ch * buffer_size */
+    int32_t **in_ptrs;       /* num_in_ch entries */
+    int32_t **out_ptrs;      /* num_out_ch entries */
 };
 
 static int jack_process_cb(jack_nframes_t nframes, void *arg) {
@@ -31,15 +38,17 @@ static int jack_process_cb(jack_nframes_t nframes, void *arg) {
     int nc_in  = ctx->num_in_ch;
     int nc_out = ctx->num_out_ch;
 
-    ctx->in_scratch.assign(nc_in * nframes, 0);
-    ctx->out_scratch.assign(nc_out * nframes, 0);
-    ctx->in_s32.resize(nc_in);
-    ctx->out_s32.resize(nc_out);
+    /* Pre-allocation only covers buffer_size frames; on the rare event
+     * that the server changes its buffer size larger than what we
+     * reserved, fall back to the closest safe size. (The new pcm/rb
+     * stack tolerates short reads.) */
+    if ((int)nframes > ctx->buffer_size) nframes = (jack_nframes_t)ctx->buffer_size;
 
     for (int i = 0; i < nc_in; i++) {
-        jack_default_audio_sample_t *src = (jack_default_audio_sample_t *)
-            jack_port_get_buffer(ctx->in_ports[i], nframes);
-        int32_t *dst = ctx->in_s32[i] = ctx->in_scratch.data() + i * nframes;
+        jack_default_audio_sample_t *src =
+            (jack_default_audio_sample_t *)jack_port_get_buffer(ctx->in_ports[i], nframes);
+        int32_t *dst = ctx->in_scratch + (size_t)i * (size_t)ctx->buffer_size;
+        ctx->in_ptrs[i] = dst;
         for (jack_nframes_t j = 0; j < nframes; j++) {
             float f = src[j];
             if (f > 1.0f) f = 1.0f;
@@ -48,22 +57,22 @@ static int jack_process_cb(jack_nframes_t nframes, void *arg) {
         }
     }
 
-    for (int i = 0; i < nc_out; i++) {
-        ctx->out_s32[i] = ctx->out_scratch.data() + i * nframes;
+    if (nc_out > 0) {
+        memset(ctx->out_scratch, 0, (size_t)nc_out * (size_t)ctx->buffer_size * sizeof(int32_t));
+        for (int i = 0; i < nc_out; i++) {
+            ctx->out_ptrs[i] = ctx->out_scratch + (size_t)i * (size_t)ctx->buffer_size;
+        }
     }
-    memset(ctx->out_scratch.data(), 0, nc_out * nframes * sizeof(int32_t));
 
     if (ctx->user_callback) {
-        ctx->user_callback(
-            nc_in > 0 ? ctx->in_s32.data() : NULL,
-            nc_out > 0 ? ctx->out_s32.data() : NULL,
-            (int)nframes, ctx->user_data);
+        ctx->user_callback(nc_in > 0 ? (const int32_t * const *)ctx->in_ptrs : NULL,
+                           nc_out > 0 ? ctx->out_ptrs : NULL, (int)nframes, ctx->user_data);
     }
 
     for (int i = 0; i < nc_out; i++) {
-        jack_default_audio_sample_t *dst = (jack_default_audio_sample_t *)
-            jack_port_get_buffer(ctx->out_ports[i], nframes);
-        int32_t *src = ctx->out_s32[i];
+        jack_default_audio_sample_t *dst =
+            (jack_default_audio_sample_t *)jack_port_get_buffer(ctx->out_ports[i], nframes);
+        int32_t *src = ctx->out_ptrs[i];
         for (jack_nframes_t j = 0; j < nframes; j++) {
             dst[j] = (float)src[j] / 2147483648.0f;
         }
@@ -97,18 +106,23 @@ static int jack_init(AudioBackend *ab, const char *device_name,
         }
     }
 
-    JackContext *ctx = new JackContext();
+    JackContext *ctx = new (std::nothrow) JackContext();
+    if (!ctx) return -1;
     ab->ctx = ctx;
 
+    ctx->client        = NULL;
     ctx->num_in_ch     = num_in_ch;
     ctx->num_out_ch    = num_out_ch;
     ctx->user_callback = cb;
     ctx->user_data     = userdata;
     ctx->auto_connect  = true;
     ctx->active        = false;
+    ctx->in_scratch    = NULL;
+    ctx->out_scratch   = NULL;
+    ctx->in_ptrs       = NULL;
+    ctx->out_ptrs      = NULL;
 
-    const char *client_name = device_name && device_name[0] ?
-                               device_name : "ulllas";
+    const char *client_name = device_name && device_name[0] ? device_name : "ulllas";
     jack_status_t status;
     ctx->client = jack_client_open(client_name, JackNullOption, &status, NULL);
     if (!ctx->client) {
@@ -157,10 +171,34 @@ static int jack_init(AudioBackend *ab, const char *device_name,
     ab->buffer_size         = ctx->buffer_size;
     ab->sample_rate         = (unsigned int)jack_get_sample_rate(ctx->client);
 
-    ctx->in_scratch.reserve(num_in_ch * ctx->buffer_size);
-    ctx->out_scratch.reserve(num_out_ch * ctx->buffer_size);
-    ctx->in_s32.reserve(num_in_ch);
-    ctx->out_s32.reserve(num_out_ch);
+    /* Pre-allocate scratch buffers. Nothing in jack_process_cb may
+     * allocate after this point. */
+    if (num_in_ch > 0) {
+        ctx->in_scratch = (int32_t *)calloc((size_t)num_in_ch * (size_t)ctx->buffer_size, sizeof(int32_t));
+        ctx->in_ptrs    = (int32_t **)calloc((size_t)num_in_ch, sizeof(int32_t *));
+        if (!ctx->in_scratch || !ctx->in_ptrs) {
+            jack_client_close(ctx->client);
+            free(ctx->in_scratch);
+            free(ctx->in_ptrs);
+            delete ctx;
+            ab->ctx = NULL;
+            return -1;
+        }
+    }
+    if (num_out_ch > 0) {
+        ctx->out_scratch = (int32_t *)calloc((size_t)num_out_ch * (size_t)ctx->buffer_size, sizeof(int32_t));
+        ctx->out_ptrs    = (int32_t **)calloc((size_t)num_out_ch, sizeof(int32_t *));
+        if (!ctx->out_scratch || !ctx->out_ptrs) {
+            jack_client_close(ctx->client);
+            free(ctx->in_scratch);
+            free(ctx->in_ptrs);
+            free(ctx->out_scratch);
+            free(ctx->out_ptrs);
+            delete ctx;
+            ab->ctx = NULL;
+            return -1;
+        }
+    }
 
     return 0;
 }
@@ -226,7 +264,11 @@ static void jack_destroy(AudioBackend *ab) {
     JackContext *ctx = (JackContext *)ab->ctx;
     if (!ctx) return;
     if (ctx->active) jack_deactivate(ctx->client);
-    jack_client_close(ctx->client);
+    if (ctx->client) jack_client_close(ctx->client);
+    free(ctx->in_scratch);
+    free(ctx->out_scratch);
+    free(ctx->in_ptrs);
+    free(ctx->out_ptrs);
     delete ctx;
     ab->ctx = NULL;
 }

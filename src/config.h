@@ -31,6 +31,12 @@ typedef struct {
     bool use_multicast;
     unsigned int jitter_packets;
 
+    /* Opt-in stability features. All default off so behavior is
+     * deterministic and the user is in control. */
+    bool plc;             /* packet loss concealment with sample-hold + fade */
+    unsigned int fec_group_size; /* 0 = off; otherwise [2..16] data packets per parity */
+    bool drift_comp;      /* drop/insert single frames over time to track sender clock */
+
     bool list_devices;
     bool verbose;
 } Config;

@@ -2,164 +2,233 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Atomic ops on uint64_t for SPSC. Acquire on the foreign-written side,
+ * release on the own-written side. The relaxed loads on the own side are
+ * intentional - we always store the latest value ourselves on the same
+ * thread, so a relaxed load races with no other writer.
+ */
 #if defined(__GNUC__) || defined(__clang__)
-#define ATOMIC_LOAD(p)   __atomic_load_n(p, __ATOMIC_ACQUIRE)
-#define ATOMIC_STORE(p,v) __atomic_store_n(p, v, __ATOMIC_RELEASE)
-#define ATOMIC_LOAD_RELAXED(p) __atomic_load_n(p, __ATOMIC_RELAXED)
+#define ATOMIC_LOAD_ACQ(p)      __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define ATOMIC_LOAD_RELAXED(p)  __atomic_load_n((p), __ATOMIC_RELAXED)
+#define ATOMIC_STORE_REL(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define ATOMIC_STORE_RELAXED(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
 #elif defined(_MSC_VER)
 #include <windows.h>
-#define ATOMIC_LOAD(p)   InterlockedExchangeAdd64((LONG64*)(p), 0)
-#define ATOMIC_STORE(p,v) InterlockedExchange64((LONG64*)(p), (LONG64)(v))
-#define ATOMIC_LOAD_RELAXED(p) (*(p))
+static inline uint64_t rb_atomic_load_acq(const uint64_t *p) {
+    return (uint64_t)InterlockedExchangeAdd64((volatile LONG64 *)p, 0);
+}
+static inline void rb_atomic_store_rel(uint64_t *p, uint64_t v) {
+    InterlockedExchange64((volatile LONG64 *)p, (LONG64)v);
+}
+#define ATOMIC_LOAD_ACQ(p)         rb_atomic_load_acq(p)
+#define ATOMIC_LOAD_RELAXED(p)     (*(volatile uint64_t *)(p))
+#define ATOMIC_STORE_REL(p, v)     rb_atomic_store_rel((p), (v))
+#define ATOMIC_STORE_RELAXED(p, v) (*(volatile uint64_t *)(p) = (v))
 #else
-#error Unsupported compiler
+#error Unsupported compiler for atomics
 #endif
 
-int rb_init(RingBuffer *rb, size_t capacity_samples) {
-    size_t size = 1;
-    while (size < capacity_samples) size <<= 1;
-    rb->buffer = (int32_t *)calloc(size, sizeof(int32_t));
+static size_t next_pow2(size_t n) {
+    size_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+int rb_init(RingBuffer *rb, size_t capacity_frames, int channels) {
+    if (channels <= 0 || channels > 255) return -1;
+    memset(rb, 0, sizeof(*rb));
+    size_t frames = next_pow2(capacity_frames < 2 ? 2 : capacity_frames);
+    rb->buffer = (int32_t *)calloc(frames * (size_t)channels, sizeof(int32_t));
     if (!rb->buffer) return -1;
-    rb->size = size;
-    rb->mask = size - 1;
-    rb->read_idx = 0;
-    rb->write_idx = 0;
+    rb->frame_count  = frames;
+    rb->mask         = frames - 1;
+    rb->channels     = channels;
+    rb->write_frames = 0;
+    rb->read_frames  = 0;
     return 0;
 }
 
 void rb_destroy(RingBuffer *rb) {
+    if (!rb) return;
     free(rb->buffer);
     rb->buffer = NULL;
-    rb->size = 0;
+    rb->frame_count = 0;
 }
 
-size_t rb_available_read(const RingBuffer *rb) {
-    size_t w = ATOMIC_LOAD(&rb->write_idx);
-    size_t r = ATOMIC_LOAD_RELAXED(&rb->read_idx);
-    return w - r;
+size_t rb_available_read_frames(const RingBuffer *rb) {
+    uint64_t w = ATOMIC_LOAD_ACQ(&rb->write_frames);
+    uint64_t r = ATOMIC_LOAD_RELAXED(&rb->read_frames);
+    return (size_t)(w - r);
 }
 
-size_t rb_available_write(const RingBuffer *rb) {
-    size_t r = ATOMIC_LOAD(&rb->read_idx);
-    size_t w = ATOMIC_LOAD_RELAXED(&rb->write_idx);
-    return rb->size - (w - r);
+size_t rb_available_write_frames(const RingBuffer *rb) {
+    uint64_t r = ATOMIC_LOAD_ACQ(&rb->read_frames);
+    uint64_t w = ATOMIC_LOAD_RELAXED(&rb->write_frames);
+    return rb->frame_count - (size_t)(w - r);
 }
 
-size_t rb_write(RingBuffer *rb, const int32_t * const *channels,
-                int num_channels, size_t samples) {
-    size_t avail = rb_available_write(rb) / num_channels;
-    if (avail < samples) samples = avail;
-    if (samples == 0) return 0;
+size_t rb_write(RingBuffer *rb, const int32_t *const *channels, size_t frames) {
+    if (frames == 0) return 0;
+    size_t avail = rb_available_write_frames(rb);
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
 
-    size_t w = ATOMIC_LOAD_RELAXED(&rb->write_idx);
-    size_t total = samples * num_channels;
-    size_t idx = w & rb->mask;
+    int      nch = rb->channels;
+    uint64_t w   = ATOMIC_LOAD_RELAXED(&rb->write_frames);
+    size_t   idx = (size_t)w & rb->mask;
 
-    if (idx + total <= rb->size) {
-        if (num_channels == 2) {
-            const int32_t *src0 = channels[0];
-            const int32_t *src1 = channels[1];
-            int32_t *dst = rb->buffer + idx;
-            for (size_t i = 0; i < samples; i++) {
-                dst[0] = src0[i];
-                dst[1] = src1[i];
-                dst += 2;
+    size_t first = rb->frame_count - idx;
+    if (first > frames) first = frames;
+
+    /* Contiguous chunk. */
+    {
+        int32_t *base = rb->buffer + idx * (size_t)nch;
+        if (nch == 2) {
+            const int32_t *s0 = channels[0];
+            const int32_t *s1 = channels[1];
+            for (size_t i = 0; i < first; i++) {
+                base[i * 2 + 0] = s0[i];
+                base[i * 2 + 1] = s1[i];
             }
         } else {
-            for (int ch = 0; ch < num_channels; ch++) {
-                const int32_t *src = channels[ch];
-                int32_t *dst = rb->buffer + idx + ch;
-                for (size_t i = 0; i < samples; i++) {
-                    *dst = src[i];
-                    dst += num_channels;
-                }
-            }
-        }
-    } else {
-        size_t first = rb->size - idx;
-        size_t first_samples = first / num_channels;
-        size_t remaining = samples - first_samples;
-
-        if (num_channels == 2) {
-            const int32_t *src0 = channels[0];
-            const int32_t *src1 = channels[1];
-            int32_t *dst = rb->buffer + idx;
-            for (size_t i = 0; i < first_samples; i++) {
-                dst[0] = src0[i];
-                dst[1] = src1[i];
-                dst += 2;
-            }
-            dst = rb->buffer;
-            for (size_t i = 0; i < remaining; i++) {
-                dst[0] = src0[first_samples + i];
-                dst[1] = src1[first_samples + i];
-                dst += 2;
-            }
-        } else {
-            for (int ch = 0; ch < num_channels; ch++) {
-                const int32_t *src_ch = channels[ch];
-                int32_t *dst = rb->buffer + idx + ch;
-                for (size_t i = 0; i < first_samples; i++) {
-                    *dst = src_ch[i];
-                    dst += num_channels;
-                }
-                dst = rb->buffer + ch;
-                for (size_t i = 0; i < remaining; i++) {
-                    *dst = src_ch[first_samples + i];
-                    dst += num_channels;
-                }
+            for (size_t i = 0; i < first; i++) {
+                int32_t *f = base + i * (size_t)nch;
+                for (int ch = 0; ch < nch; ch++) f[ch] = channels[ch][i];
             }
         }
     }
 
-    ATOMIC_STORE(&rb->write_idx, w + total);
-    return samples;
-}
-
-size_t rb_read(RingBuffer *rb, int32_t * const *channels,
-               int num_channels, size_t samples) {
-    size_t avail = rb_available_read(rb) / num_channels;
-    if (avail < samples) samples = avail;
-    if (samples == 0) return 0;
-
-    size_t r = ATOMIC_LOAD_RELAXED(&rb->read_idx);
-    size_t total = samples * num_channels;
-    size_t idx = r & rb->mask;
-
-    if (idx + total <= rb->size) {
-        for (int ch = 0; ch < num_channels; ch++) {
-            int32_t *dst = channels[ch];
-            const int32_t *src = rb->buffer + idx + ch;
-            for (size_t i = 0; i < samples; i++) {
-                dst[i] = *src;
-                src += num_channels;
+    /* Wrapped tail. */
+    if (first < frames) {
+        size_t   remain = frames - first;
+        int32_t *base   = rb->buffer;
+        if (nch == 2) {
+            const int32_t *s0 = channels[0];
+            const int32_t *s1 = channels[1];
+            for (size_t i = 0; i < remain; i++) {
+                base[i * 2 + 0] = s0[first + i];
+                base[i * 2 + 1] = s1[first + i];
             }
-        }
-    } else {
-        size_t first = rb->size - idx;
-        size_t first_samples = first / num_channels;
-        size_t remaining = samples - first_samples;
-
-        for (int ch = 0; ch < num_channels; ch++) {
-            int32_t *dst_ch = channels[ch];
-            const int32_t *src = rb->buffer + idx + ch;
-            for (size_t i = 0; i < first_samples; i++) {
-                dst_ch[i] = *src;
-                src += num_channels;
-            }
-            src = rb->buffer + ch;
-            for (size_t i = 0; i < remaining; i++) {
-                dst_ch[first_samples + i] = *src;
-                src += num_channels;
+        } else {
+            for (size_t i = 0; i < remain; i++) {
+                int32_t *f = base + i * (size_t)nch;
+                for (int ch = 0; ch < nch; ch++) f[ch] = channels[ch][first + i];
             }
         }
     }
 
-    ATOMIC_STORE(&rb->read_idx, r + total);
-    return samples;
+    ATOMIC_STORE_REL(&rb->write_frames, w + frames);
+    return frames;
+}
+
+size_t rb_read(RingBuffer *rb, int32_t *const *channels, size_t frames) {
+    if (frames == 0) return 0;
+    size_t avail = rb_available_read_frames(rb);
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
+
+    int      nch = rb->channels;
+    uint64_t r   = ATOMIC_LOAD_RELAXED(&rb->read_frames);
+    size_t   idx = (size_t)r & rb->mask;
+
+    size_t first = rb->frame_count - idx;
+    if (first > frames) first = frames;
+
+    {
+        const int32_t *base = rb->buffer + idx * (size_t)nch;
+        if (nch == 2) {
+            int32_t *d0 = channels[0];
+            int32_t *d1 = channels[1];
+            for (size_t i = 0; i < first; i++) {
+                d0[i] = base[i * 2 + 0];
+                d1[i] = base[i * 2 + 1];
+            }
+        } else {
+            for (size_t i = 0; i < first; i++) {
+                const int32_t *f = base + i * (size_t)nch;
+                for (int ch = 0; ch < nch; ch++) channels[ch][i] = f[ch];
+            }
+        }
+    }
+
+    if (first < frames) {
+        size_t         remain = frames - first;
+        const int32_t *base   = rb->buffer;
+        if (nch == 2) {
+            int32_t *d0 = channels[0];
+            int32_t *d1 = channels[1];
+            for (size_t i = 0; i < remain; i++) {
+                d0[first + i] = base[i * 2 + 0];
+                d1[first + i] = base[i * 2 + 1];
+            }
+        } else {
+            for (size_t i = 0; i < remain; i++) {
+                const int32_t *f = base + i * (size_t)nch;
+                for (int ch = 0; ch < nch; ch++) channels[ch][first + i] = f[ch];
+            }
+        }
+    }
+
+    ATOMIC_STORE_REL(&rb->read_frames, r + frames);
+    return frames;
+}
+
+size_t rb_write_interleaved(RingBuffer *rb, const int32_t *src, size_t frames) {
+    if (frames == 0) return 0;
+    size_t avail = rb_available_write_frames(rb);
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
+
+    int      nch = rb->channels;
+    uint64_t w   = ATOMIC_LOAD_RELAXED(&rb->write_frames);
+    size_t   idx = (size_t)w & rb->mask;
+
+    size_t first = rb->frame_count - idx;
+    if (first > frames) first = frames;
+
+    memcpy(rb->buffer + idx * (size_t)nch, src, first * (size_t)nch * sizeof(int32_t));
+    if (first < frames) {
+        memcpy(rb->buffer, src + first * (size_t)nch, (frames - first) * (size_t)nch * sizeof(int32_t));
+    }
+
+    ATOMIC_STORE_REL(&rb->write_frames, w + frames);
+    return frames;
+}
+
+size_t rb_read_interleaved(RingBuffer *rb, int32_t *dst, size_t frames) {
+    if (frames == 0) return 0;
+    size_t avail = rb_available_read_frames(rb);
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
+
+    int      nch = rb->channels;
+    uint64_t r   = ATOMIC_LOAD_RELAXED(&rb->read_frames);
+    size_t   idx = (size_t)r & rb->mask;
+
+    size_t first = rb->frame_count - idx;
+    if (first > frames) first = frames;
+
+    memcpy(dst, rb->buffer + idx * (size_t)nch, first * (size_t)nch * sizeof(int32_t));
+    if (first < frames) {
+        memcpy(dst + first * (size_t)nch, rb->buffer, (frames - first) * (size_t)nch * sizeof(int32_t));
+    }
+
+    ATOMIC_STORE_REL(&rb->read_frames, r + frames);
+    return frames;
+}
+
+size_t rb_skip_read(RingBuffer *rb, size_t frames) {
+    if (frames == 0) return 0;
+    size_t avail = rb_available_read_frames(rb);
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
+    uint64_t r = ATOMIC_LOAD_RELAXED(&rb->read_frames);
+    ATOMIC_STORE_REL(&rb->read_frames, r + frames);
+    return frames;
 }
 
 void rb_reset(RingBuffer *rb) {
-    size_t w = ATOMIC_LOAD(&rb->write_idx);
-    ATOMIC_STORE(&rb->read_idx, w);
+    uint64_t w = ATOMIC_LOAD_ACQ(&rb->write_frames);
+    ATOMIC_STORE_REL(&rb->read_frames, w);
 }

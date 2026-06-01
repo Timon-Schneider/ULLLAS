@@ -10,69 +10,70 @@
 #include <string.h>
 #include <algorithm>
 #include <new>
-#include <vector>
 
+/*
+ * CoreAudio's render callback is real-time: no allocations, no syscalls.
+ * v1 called calloc/free/resize the first time each buffer size was seen,
+ * which caused a one-off (or recurring on device reconfig) audio glitch.
+ * v2 sizes all scratch up-front to a comfortable max (4x the configured
+ * buffer size, capped at 4096 frames). The render callbacks clamp
+ * incoming nframes to that cap so they never need to allocate.
+ */
 struct CoreAudioContext {
-    AudioUnit           unit;
-    audio_callback_t    user_callback;
-    void               *user_data;
-    int                 num_in_ch;
-    int                 num_out_ch;
-    int                 buffer_size;
-    unsigned int        sample_rate;
-    bool                active;
-    AudioDeviceID       device_id;
+    AudioUnit        unit;
+    audio_callback_t user_callback;
+    void            *user_data;
+    int              num_in_ch;
+    int              num_out_ch;
+    int              buffer_size;
+    int              max_scratch_frames;
+    unsigned int     sample_rate;
+    bool             active;
+    AudioDeviceID    device_id;
 
-    AudioBufferList    *input_buf_list;
-    float              *input_buf_data;
-    UInt32              input_buf_frames;
+    AudioBufferList *input_buf_list;
+    float           *input_buf_data;
 
-    std::vector<int32_t>  int32_scratch;
-    std::vector<int32_t*> int32_ptr_scratch;
+    int32_t  *int32_scratch;
+    int32_t **int32_ptr_scratch;
 };
 
-static bool ensure_scratch(CoreAudioContext *ctx, UInt32 nframes) {
+static bool alloc_all_scratch(CoreAudioContext *ctx, int frames_max) {
     int ch = std::max(ctx->num_in_ch, ctx->num_out_ch);
-    if (ch <= 0) return true;
+    if (ch <= 0) ch = 1;
+    ctx->max_scratch_frames = frames_max;
 
-    size_t needed = (size_t)ch * (size_t)nframes;
-    if (ctx->int32_scratch.size() < needed) {
-        ctx->int32_scratch.resize(needed);
-        ctx->int32_ptr_scratch.resize(ch);
-    }
+    size_t total = (size_t)ch * (size_t)frames_max;
+    ctx->int32_scratch     = (int32_t *)calloc(total, sizeof(int32_t));
+    ctx->int32_ptr_scratch = (int32_t **)calloc((size_t)ch, sizeof(int32_t *));
+    if (!ctx->int32_scratch || !ctx->int32_ptr_scratch) return false;
     for (int i = 0; i < ch; i++) {
-        ctx->int32_ptr_scratch[i] = ctx->int32_scratch.data() + i * nframes;
+        ctx->int32_ptr_scratch[i] = ctx->int32_scratch + (size_t)i * (size_t)frames_max;
     }
-    return true;
-}
 
-static bool ensure_input_bufs(CoreAudioContext *ctx, UInt32 nframes) {
-    if (!ctx->input_buf_list || ctx->input_buf_frames < nframes) {
-        if (ctx->input_buf_data) {
-            free(ctx->input_buf_data);
-            free(ctx->input_buf_list);
-        }
-
-        size_t list_sz = offsetof(AudioBufferList, mBuffers[ctx->num_in_ch]);
+    if (ctx->num_in_ch > 0) {
+        size_t list_sz      = offsetof(AudioBufferList, mBuffers[ctx->num_in_ch]);
         ctx->input_buf_list = (AudioBufferList *)calloc(1, list_sz);
         if (!ctx->input_buf_list) return false;
 
-        ctx->input_buf_data = (float *)calloc((size_t)ctx->num_in_ch * nframes, sizeof(float));
-        if (!ctx->input_buf_data) {
-            free(ctx->input_buf_list);
-            ctx->input_buf_list = NULL;
-            return false;
-        }
+        ctx->input_buf_data = (float *)calloc((size_t)ctx->num_in_ch * (size_t)frames_max, sizeof(float));
+        if (!ctx->input_buf_data) return false;
 
         ctx->input_buf_list->mNumberBuffers = ctx->num_in_ch;
         for (int i = 0; i < ctx->num_in_ch; i++) {
             ctx->input_buf_list->mBuffers[i].mNumberChannels = 1;
-            ctx->input_buf_list->mBuffers[i].mDataByteSize = nframes * sizeof(float);
-            ctx->input_buf_list->mBuffers[i].mData = ctx->input_buf_data + i * nframes;
+            ctx->input_buf_list->mBuffers[i].mDataByteSize   = (UInt32)(frames_max * (int)sizeof(float));
+            ctx->input_buf_list->mBuffers[i].mData           = ctx->input_buf_data + (size_t)i * (size_t)frames_max;
         }
-        ctx->input_buf_frames = nframes;
     }
     return true;
+}
+
+static inline UInt32 clamp_frames(CoreAudioContext *ctx, UInt32 nframes) {
+    if ((int)nframes > ctx->max_scratch_frames) {
+        return (UInt32)ctx->max_scratch_frames;
+    }
+    return nframes;
 }
 
 static OSStatus input_callback_proc(void *inRefCon,
@@ -85,22 +86,22 @@ static OSStatus input_callback_proc(void *inRefCon,
     (void)ioData;
     (void)inBusNumber;
 
-    if (!ensure_input_bufs(ctx, inNumberFrames)) return kAudioUnitErr_FailedInitialization;
-    if (!ensure_scratch(ctx, inNumberFrames)) return kAudioUnitErr_FailedInitialization;
+    inNumberFrames = clamp_frames(ctx, inNumberFrames);
 
-    OSStatus err = AudioUnitRender(ctx->unit, ioActionFlags, inTimeStamp,
-                                    inBusNumber, inNumberFrames,
-                                    ctx->input_buf_list);
+    /* Reset each input AudioBuffer's mDataByteSize because AudioUnitRender
+     * adjusts it down to the bytes actually delivered and then back. */
+    for (int i = 0; i < ctx->num_in_ch; i++) {
+        ctx->input_buf_list->mBuffers[i].mDataByteSize = inNumberFrames * (UInt32)sizeof(float);
+    }
+
+    OSStatus err = AudioUnitRender(ctx->unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames,
+                                   ctx->input_buf_list);
     if (err != noErr) {
-        static int render_errs = 0;
-        if (render_errs++ < 1) {
-            fprintf(stderr, "CoreAudio: input unavailable (check mic permission in System Settings > Privacy & Security > Microphone)\n");
-        }
         return noErr;
     }
 
     for (int ch = 0; ch < ctx->num_in_ch; ch++) {
-        float *src = (float *)ctx->input_buf_list->mBuffers[ch].mData;
+        float   *src = (float *)ctx->input_buf_list->mBuffers[ch].mData;
         int32_t *dst = ctx->int32_ptr_scratch[ch];
         for (UInt32 i = 0; i < inNumberFrames; i++) {
             float f = src[i];
@@ -110,8 +111,7 @@ static OSStatus input_callback_proc(void *inRefCon,
         }
     }
 
-    ctx->user_callback((const int32_t * const *)ctx->int32_ptr_scratch.data(),
-                       NULL, (int)inNumberFrames, ctx->user_data);
+    ctx->user_callback((const int32_t * const *)ctx->int32_ptr_scratch, NULL, (int)inNumberFrames, ctx->user_data);
 
     return noErr;
 }
@@ -134,14 +134,13 @@ static OSStatus render_callback_proc(void *inRefCon,
         return noErr;
     }
 
-    if (!ensure_scratch(ctx, inNumberFrames)) return kAudioUnitErr_FailedInitialization;
+    inNumberFrames = clamp_frames(ctx, inNumberFrames);
 
-    ctx->user_callback(NULL, ctx->int32_ptr_scratch.data(),
-                       (int)inNumberFrames, ctx->user_data);
+    ctx->user_callback(NULL, ctx->int32_ptr_scratch, (int)inNumberFrames, ctx->user_data);
 
     for (int ch = 0; ch < ctx->num_out_ch; ch++) {
         int32_t *src = ctx->int32_ptr_scratch[ch];
-        float *dst = (float *)ioData->mBuffers[ch].mData;
+        float   *dst = (float *)ioData->mBuffers[ch].mData;
         for (UInt32 i = 0; i < inNumberFrames; i++) {
             dst[i] = (float)src[i] / 2147483648.0f;
         }
@@ -248,18 +247,20 @@ static int coreaudio_init(AudioBackend *ab, const char *device_name,
     if (!ctx) return -1;
     ab->ctx = ctx;
 
-    ctx->num_in_ch     = num_in_ch;
-    ctx->num_out_ch    = num_out_ch;
-    ctx->user_callback = cb;
-    ctx->user_data     = userdata;
-    ctx->active        = false;
-    ctx->device_id     = 0;
-    ctx->unit          = NULL;
-    ctx->sample_rate   = sample_rate;
-    ctx->buffer_size   = (int)buffer_size;
-    ctx->input_buf_list = NULL;
-    ctx->input_buf_data = NULL;
-    ctx->input_buf_frames = 0;
+    ctx->num_in_ch          = num_in_ch;
+    ctx->num_out_ch         = num_out_ch;
+    ctx->user_callback      = cb;
+    ctx->user_data          = userdata;
+    ctx->active             = false;
+    ctx->device_id          = 0;
+    ctx->unit               = NULL;
+    ctx->sample_rate        = sample_rate;
+    ctx->buffer_size        = (int)buffer_size;
+    ctx->max_scratch_frames = 0;
+    ctx->input_buf_list     = NULL;
+    ctx->input_buf_data     = NULL;
+    ctx->int32_scratch      = NULL;
+    ctx->int32_ptr_scratch  = NULL;
 
     AudioComponentDescription desc;
     memset(&desc, 0, sizeof(desc));
@@ -488,10 +489,18 @@ static int coreaudio_init(AudioBackend *ab, const char *device_name,
 
     ctx->sample_rate = sample_rate;
 
-    int max_ch = std::max(num_in_ch, num_out_ch);
-    if (max_ch > 0) {
-        ctx->int32_scratch.reserve(max_ch * 4096);
-        ctx->int32_ptr_scratch.reserve(max_ch);
+    /* Size all RT scratch up-front with 4x headroom so the render
+     * callbacks never need to allocate. Cap at 4096 frames which is
+     * the largest CoreAudio buffer we ever practically see. */
+    int frames_max = ctx->buffer_size * 4;
+    if (frames_max < 256) frames_max = 256;
+    if (frames_max > 4096) frames_max = 4096;
+    if (!alloc_all_scratch(ctx, frames_max)) {
+        fprintf(stderr, "CoreAudio: failed to allocate scratch buffers\n");
+        AudioComponentInstanceDispose(ctx->unit);
+        delete ctx;
+        ab->ctx = NULL;
+        return -1;
     }
 
     ab->num_input_channels  = num_in_ch;
@@ -537,8 +546,10 @@ static void coreaudio_destroy(AudioBackend *ab) {
     AudioUnitUninitialize(ctx->unit);
     AudioComponentInstanceDispose(ctx->unit);
 
-    if (ctx->input_buf_data) free(ctx->input_buf_data);
-    if (ctx->input_buf_list) free(ctx->input_buf_list);
+    free(ctx->input_buf_data);
+    free(ctx->input_buf_list);
+    free(ctx->int32_scratch);
+    free(ctx->int32_ptr_scratch);
 
     delete ctx;
     ab->ctx = NULL;
