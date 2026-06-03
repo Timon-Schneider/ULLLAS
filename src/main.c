@@ -282,6 +282,8 @@ static void rx_emit_packet(uint32_t seq, uint16_t num_samples, const uint8_t *pa
         return;
     }
     plc_observe_packet(&st->plc, st->unpack_scratch, (int)n);
+
+    size_t avail_before = rb_available_read_frames(&st->rb);
     rb_write_interleaved(&st->rb, st->unpack_scratch, n);
 
     if (st->cfg->verbose) {
@@ -292,18 +294,14 @@ static void rx_emit_packet(uint32_t seq, uint16_t num_samples, const uint8_t *pa
     st->last_emitted_seq = seq;
     st->have_last_seq    = 1;
 
-    /* Drift compensation: every ~100 packets check ring fill vs target.
-     * Tweak by at most one frame per check - inaudible cumulatively. */
-    if (st->drift_comp_enabled && ++st->drift_tick >= 100) {
+    if (st->drift_comp_enabled && ++st->drift_tick >= 5) {
         st->drift_tick = 0;
-        size_t avail   = rb_available_read_frames(&st->rb);
-        size_t target  = (size_t)st->jitter_target_frames;
-        size_t tol     = (size_t)st->buffer_size;
-        if (avail > target + tol * 4) {
+        size_t target = (size_t)st->jitter_target_frames;
+        size_t bs     = (size_t)st->buffer_size;
+        if (avail_before > target + bs * 3) {
             rb_skip_read(&st->rb, 1);
             st->total_drift_drops++;
-        } else if (avail > 0 && avail + tol < target && st->unpack_scratch_frames > 0) {
-            /* Duplicate the most recently observed frame once. */
+        } else if (avail_before > 0 && avail_before < bs && st->unpack_scratch_frames > 0) {
             for (int ch = 0; ch < st->channels; ch++) {
                 st->unpack_scratch[ch] = st->plc.last_frame[ch];
             }

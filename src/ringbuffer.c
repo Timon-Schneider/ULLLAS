@@ -9,10 +9,11 @@
  * thread, so a relaxed load races with no other writer.
  */
 #if defined(__GNUC__) || defined(__clang__)
-#define ATOMIC_LOAD_ACQ(p)      __atomic_load_n((p), __ATOMIC_ACQUIRE)
-#define ATOMIC_LOAD_RELAXED(p)  __atomic_load_n((p), __ATOMIC_RELAXED)
-#define ATOMIC_STORE_REL(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define ATOMIC_LOAD_ACQ(p)       __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define ATOMIC_LOAD_RELAXED(p)   __atomic_load_n((p), __ATOMIC_RELAXED)
+#define ATOMIC_STORE_REL(p, v)   __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 #define ATOMIC_STORE_RELAXED(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
+#define ATOMIC_ADD_RELAXED(p, v) __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
 #elif defined(_MSC_VER)
 #include <windows.h>
 static inline uint64_t rb_atomic_load_acq(const uint64_t *p) {
@@ -21,10 +22,11 @@ static inline uint64_t rb_atomic_load_acq(const uint64_t *p) {
 static inline void rb_atomic_store_rel(uint64_t *p, uint64_t v) {
     InterlockedExchange64((volatile LONG64 *)p, (LONG64)v);
 }
-#define ATOMIC_LOAD_ACQ(p)         rb_atomic_load_acq(p)
-#define ATOMIC_LOAD_RELAXED(p)     (*(volatile uint64_t *)(p))
-#define ATOMIC_STORE_REL(p, v)     rb_atomic_store_rel((p), (v))
-#define ATOMIC_STORE_RELAXED(p, v) (*(volatile uint64_t *)(p) = (v))
+#define ATOMIC_LOAD_ACQ(p)          rb_atomic_load_acq(p)
+#define ATOMIC_LOAD_RELAXED(p)      (*(volatile uint64_t *)(p))
+#define ATOMIC_STORE_REL(p, v)      rb_atomic_store_rel((p), (v))
+#define ATOMIC_STORE_RELAXED(p, v)  (*(volatile uint64_t *)(p) = (v))
+#define ATOMIC_ADD_RELAXED(p, v)    ((uint64_t)InterlockedExchangeAdd64((volatile LONG64 *)(p), (LONG64)(v)))
 #else
 #error Unsupported compiler for atomics
 #endif
@@ -223,8 +225,7 @@ size_t rb_skip_read(RingBuffer *rb, size_t frames) {
     size_t avail = rb_available_read_frames(rb);
     if (frames > avail) frames = avail;
     if (frames == 0) return 0;
-    uint64_t r = ATOMIC_LOAD_RELAXED(&rb->read_frames);
-    ATOMIC_STORE_REL(&rb->read_frames, r + frames);
+    ATOMIC_ADD_RELAXED(&rb->read_frames, frames);
     return frames;
 }
 
