@@ -20,6 +20,7 @@ static void config_set_defaults(Config *cfg) {
     cfg->port           = 9000;
     cfg->use_multicast  = true;
     cfg->jitter_packets = 2;
+    cfg->jitter_set    = false;
     cfg->plc            = false;
     cfg->fec_group_size = 0;
     cfg->drift_comp     = false;
@@ -161,8 +162,9 @@ int config_parse(Config *cfg, int argc, char **argv) {
             strncpy(cfg->iface_addr, argv[++i], sizeof(cfg->iface_addr) - 1);
         } else if (strcmp(argv[i], "--unicast") == 0) {
             cfg->use_multicast = false;
-        } else if (strcmp(argv[i], "--jitter") == 0 && i + 1 < argc) {
-            cfg->jitter_packets = (unsigned int)atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--jitter") == 0 && i + 1 < argc) {
+        cfg->jitter_packets = (unsigned int)atoi(argv[++i]);
+        cfg->jitter_set     = true;
         } else if (strcmp(argv[i], "--plc") == 0) {
             cfg->plc = true;
         } else if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) {
@@ -228,6 +230,9 @@ int config_parse(Config *cfg, int argc, char **argv) {
     }
     if (cfg->is_sender && cfg->plc) {
         fprintf(stderr, "Warning: --plc only affects the receiver, ignoring on sender\n");
+    }
+    if (cfg->is_sender && cfg->jitter_set) {
+        fprintf(stderr, "Warning: --jitter only affects the receiver, ignoring on sender\n");
     }
 
     if (!cfg->list_devices) {

@@ -30,6 +30,7 @@ typedef struct {
     char iface_addr[64];
     bool use_multicast;
     unsigned int jitter_packets;
+    bool jitter_set;       /* track explicit --jitter for sender warning */
 
     /* Opt-in stability features. All default off so behavior is
      * deterministic and the user is in control. */

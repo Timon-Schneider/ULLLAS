@@ -129,7 +129,7 @@ ulllas recv --out-channels 0,1 --port 9000
 | `--port <port>` | both | `9000` | UDP port to send to / listen on |
 | `--iface <ip>` | send | `0.0.0.0` | Outbound interface IP for multicast |
 | `--unicast` | both | off | Use unicast instead of multicast |
-| `--jitter <packets>` | recv | `2` | Static jitter buffer size in packets (1–8). Always honored; no adaptive sizing |
+| `--jitter <packets>` | recv | `2` | Receiver-only: static jitter buffer size in packets (1–8). Ignored on sender |
 | `--plc` | recv | off | Packet loss concealment: hold the last frame briefly then fade to silence on loss. No added latency |
 | `--fec <N>` | both | off | XOR forward error correction: send a parity packet every `N` data packets. Receiver delays playback by one FEC group (`N+1` packets) to enable recovery. `N` in `[2..16]` |
 | `--drift-comp` | recv | off | Drop or duplicate one frame occasionally to track the sender's clock over long sessions |
@@ -151,6 +151,63 @@ ulllas recv --out-channels 0,1 --port 9000
 - **Channel routing** — map specific ASIO/JACK inputs/outputs to network streams
 - **Jitter buffer** — configurable 1–8 packet buffer for network jitter smoothing
 - **Zero external runtime dependencies** — fully statically linked on Windows, single `.exe`; uses system frameworks on macOS/Linux
+
+---
+
+## Latency Reference
+
+All calculations assume **48 kHz sample rate** and negligible LAN network latency (<1 ms). The sender and receiver audio buffers each add **buffer / sample_rate** seconds. On the receiver, `--jitter N` adds **N × buffer** frames of jitter buffer latency.
+
+`--drift-comp` inserts a variable-rate Lanczos sample-rate converter (SRC) in the receiver pipeline. The SRC maintains its own internal FIFO (target: 64 frames) plus a filter group delay of 3.5 frames (8-tap symmetric FIR), adding **~1.4 ms** of additional latency.
+
+### Default config (`--buffer 128 --jitter 2`)
+
+| Pipeline Stage | Frames | Latency |
+|---|---|---|
+| Sender capture buffer | 128 | 2.67 ms |
+| Receiver jitter buffer | 2 × 128 = 256 | 5.33 ms |
+| Receiver output buffer | 128 | 2.67 ms |
+| **E2E (no drift-comp)** | **512** | **10.67 ms** |
+
+| Pipeline Stage | Frames | Latency |
+|---|---|---|
+| Sender capture buffer | 128 | 2.67 ms |
+| Receiver jitter buffer | 2 × 128 = 256 | 5.33 ms |
+| SRC FIFO target | 64 | 1.33 ms |
+| SRC filter group delay | 3.5 | 0.07 ms |
+| Receiver output buffer | 128 | 2.67 ms |
+| **E2E (with drift-comp)** | **579.5** | **12.07 ms** |
+
+> **Difference:** `--drift-comp` adds **+1.40 ms**
+
+### `--buffer 256 --jitter 2`
+
+| Pipeline Stage | Frames | Latency |
+|---|---|---|
+| Sender capture buffer | 256 | 5.33 ms |
+| Receiver jitter buffer | 2 × 256 = 512 | 10.67 ms |
+| Receiver output buffer | 256 | 5.33 ms |
+| **E2E (no drift-comp)** | **1024** | **21.33 ms** |
+
+| Pipeline Stage | Frames | Latency |
+|---|---|---|
+| Sender capture buffer | 256 | 5.33 ms |
+| Receiver jitter buffer | 2 × 256 = 512 | 10.67 ms |
+| SRC FIFO target | 64 | 1.33 ms |
+| SRC filter group delay | 3.5 | 0.07 ms |
+| Receiver output buffer | 256 | 5.33 ms |
+| **E2E (with drift-comp)** | **1091.5** | **22.74 ms** |
+
+> **Difference:** `--drift-comp` adds **+1.41 ms**
+
+### Additional options
+
+| Option | Latency impact |
+|---|---|
+| `--jitter N` | Adds `(N − default) × buffer` frames. Each increment of `--jitter` adds one buffer period (~2.67 ms at default 128, ~5.33 ms at 256) |
+| `--fec N` | Adds `(N + 1) × buffer` frames of FEC group delay on the receiver. E.g. `--fec 4` adds 5 × 128 = 640 frames (13.33 ms) at default buffer |
+| `--plc` | None. PLC holds the last frame and fades on loss — no additional buffering |
+| `--drift-comp` | See above. Adds SRC FIFO (64 frames) + filter group delay (3.5 frames) = ~1.4 ms |
 
 ---
 
