@@ -43,6 +43,7 @@ static int g_running_load(void) {
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 /*
  * v2 architecture:
@@ -59,6 +60,7 @@ static int g_running_load(void) {
 
 #define RX_RB_FRAMES 16384
 #define STATUS_INTERVAL_S 2
+#define DRIFT_FIFO_TARGET 64
 
 #ifdef HAS_ASIO
 extern AudioBackend *asio_backend_create(void);
@@ -150,6 +152,7 @@ typedef struct {
     volatile double src_ratio;
     size_t          src_last_consumed;
     double          buf_smooth;
+    double          buf_integral;
     int32_t        *src_buf;
     size_t          src_buf_frames;
 
@@ -169,6 +172,10 @@ typedef struct {
     uint64_t total_drift_dups;
     int      underruns;
     int32_t  peak_level;
+
+    double buf_display;
+    size_t buf_min;
+    size_t buf_max;
 } ReceiverState;
 
 static int32_t compute_peak_interleaved(const int32_t *interleaved, int channels, int frames) {
@@ -188,6 +195,11 @@ static int receiver_callback(const int32_t *const *inputs, int32_t *const *outpu
 
     size_t avail = rb_available_read_frames(&st->rb);
 
+    /* Track min/max from the audio callback's perspective — this is the
+     * honest buffer fill that the callback actually sees before consuming. */
+    if (avail < st->buf_min) st->buf_min = avail;
+    if (avail > st->buf_max) st->buf_max = avail;
+
     if (!st->started) {
         if (avail >= (size_t)st->jitter_target_frames) {
             st->started = 1;
@@ -201,11 +213,22 @@ static int receiver_callback(const int32_t *const *inputs, int32_t *const *outpu
 
     if (st->drift_comp_enabled) {
         {
-            size_t target = (size_t)st->jitter_target_frames * 2;
+            size_t target = (size_t)st->jitter_target_frames;
             st->buf_smooth = st->buf_smooth * 0.9 + (double)avail * 0.1;
             double norm_err = (st->buf_smooth - (double)target)
                             / (double)st->buffer_size;
-            double rt = 1.0 - norm_err * 0.003;
+
+            double rt = 1.0 - norm_err * 0.005;
+
+            if (fabs(norm_err) < 0.4) {
+                st->buf_integral += norm_err * 0.00005;
+                if (st->buf_integral >  0.004) st->buf_integral =  0.004;
+                if (st->buf_integral < -0.004) st->buf_integral = -0.004;
+                rt -= st->buf_integral;
+            } else {
+                st->buf_integral *= 0.997;
+            }
+
             if (rt > 1.002) rt = 1.002;
             if (rt < 0.998) rt = 0.998;
             st->src_ratio = st->src_ratio * 0.9 + rt * 0.1;
@@ -220,19 +243,17 @@ static int receiver_callback(const int32_t *const *inputs, int32_t *const *outpu
         if (base < (size_t)nframes - 1) base = (size_t)nframes - 1;
 
         /* Emergency: if the ring buffer is critically low, read one
-         * fewer frame than we produce so the buffer recovers. Also
-         * freeze the SRC ratio to avoid fighting the recovery. */
+         * fewer frame than we produce so the buffer recovers. Keep the
+         * controller's ratio — freezing it to 1.0 defeats recovery. */
         if (avail < (size_t)nframes + (size_t)DRIFT_SRC_TAPS) {
             base = (size_t)nframes - 1;
-            st->src_ratio = 1.0;
-            drift_src_set_ratio(&st->src, 1.0);
         }
 
         size_t fifo_avail  = drift_src_avail(&st->src);
         size_t needed      = base;
 
-        if (fifo_avail < (size_t)DRIFT_SRC_TAPS)
-            needed += (size_t)DRIFT_SRC_TAPS - fifo_avail;
+        if (fifo_avail < (size_t)DRIFT_FIFO_TARGET)
+            needed += (size_t)DRIFT_FIFO_TARGET - fifo_avail;
 
         if (needed > st->src_buf_frames)
             needed = st->src_buf_frames;
@@ -519,6 +540,19 @@ static int run_receiver(Config *cfg) {
 
     st.jitter_target_frames = (int)cfg->jitter_packets * st.buffer_size;
 
+    if (cfg->jitter_packets < 2) {
+        fprintf(stderr,
+                "Warning: --jitter %u is too low for unsynced clocks. "
+                "Use --jitter 2 or higher.\n",
+                cfg->jitter_packets);
+    }
+    if (!cfg->drift_comp) {
+        fprintf(stderr,
+                "Note: --drift-comp is off. If sender and receiver use independent "
+                "clocks, audio may drift and glitch over time. Consider adding "
+                "--drift-comp as a safeguard.\n");
+    }
+
     int max_per_pkt = udp_compute_max_samples_per_packet(st.channels, st.bit_depth);
     if (max_per_pkt <= 0) {
         fprintf(stderr, "Bad channels/bit_depth combination\n");
@@ -548,7 +582,8 @@ static int run_receiver(Config *cfg) {
         drift_src_init(&st.src, st.channels);
         st.src_ratio          = 1.0;
         st.src_last_consumed  = (size_t)st.buffer_size;
-        st.buf_smooth         = (double)(st.jitter_target_frames * 2);
+        st.buf_smooth         = (double)st.jitter_target_frames;
+        st.buf_integral       = 0.0;
         st.src_buf_frames     = 1024;
         st.src_buf = (int32_t *)calloc(st.src_buf_frames * (size_t)st.channels, sizeof(int32_t));
         if (!st.src_buf) {
@@ -605,6 +640,9 @@ static int run_receiver(Config *cfg) {
             st.channels, (unsigned)st.sample_rate, cfg->bit_depth, (unsigned)st.buffer_size, cfg->jitter_packets,
             st.jitter_target_frames, cfg->plc ? " [PLC]" : "", cfg->fec_group_size > 0 ? " [FEC]" : "",
             cfg->drift_comp ? " [drift-comp]" : "", cfg->port);
+    if (cfg->drift_comp) {
+        fprintf(stderr, "Drift target: %d frames\n", st.jitter_target_frames);
+    }
 #ifdef _WIN32
     fprintf(stderr, "IMPORTANT: Click the ASIO4ALL tray icon and enable your speaker/headphone output!\n");
 #endif
@@ -614,7 +652,8 @@ static int run_receiver(Config *cfg) {
      * callback already runs at driver RT priority. */
     rt_raise_thread_priority();
 
-    time_t last_status = time(NULL);
+    time_t last_status          = time(NULL);
+    st.buf_min = (size_t)-1;
     while (g_running_load()) {
         PcmHeader      hdr;
         const uint8_t *payload     = NULL;
@@ -624,9 +663,6 @@ static int run_receiver(Config *cfg) {
             break;
         }
         if (r > 0) {
-            /* If the sender announces FEC but the receiver didn't enable
-             * it, the parity packets get dropped here naturally. We do
-             * still honor data packets in that case. */
             if (st.fec_enabled) {
                 fec_rx_process(&st.fec, hdr.seq, (hdr.flags & PCM_FLAG_PARITY) ? 1 : 0, hdr.num_samples, payload,
                                rx_emit_packet, &st);
@@ -638,22 +674,33 @@ static int run_receiver(Config *cfg) {
         time_t now = time(NULL);
         if (now - last_status >= STATUS_INTERVAL_S) {
             last_status        = now;
-            size_t   avail     = rb_available_read_frames(&st.rb);
             uint64_t recovered = st.total_recovered;
             uint64_t lost      = st.total_packets_lost;
+
+            if (st.buf_display < 1.0)
+                st.buf_display = (double)(st.buf_min + st.buf_max) * 0.5;
+            else
+                st.buf_display = st.buf_display * 0.7 + (double)(st.buf_min + st.buf_max) * 0.15;
+            unsigned buf_disp = (unsigned)(st.buf_display + 0.5);
+            unsigned buf_lo   = (unsigned)st.buf_min;
+            unsigned buf_hi   = (unsigned)st.buf_max;
+
+            st.buf_min = (size_t)-1;
+            st.buf_max = 0;
+
             if (cfg->verbose) {
                 fprintf(stderr,
                         "\rRX: %llu pkts, lost %llu, recovered %llu, dups %llu, reord %llu, drift-ratio %.6f, "
-                        "underrun %d, buf %u frames, peak %d          \n",
+                        "underrun %d, buf %u (%u-%u) frames, peak %d          \n",
                         (unsigned long long)st.total_packets_rx, (unsigned long long)lost,
                         (unsigned long long)recovered, (unsigned long long)st.total_dups,
                         (unsigned long long)st.total_reorders, st.src_ratio,
-                        st.underruns, (unsigned)avail, (int)st.peak_level);
+                        st.underruns, buf_disp, buf_lo, buf_hi, (int)st.peak_level);
             } else {
                 fprintf(stderr,
-                        "\rRX: %llu pkts, lost %llu, recovered %llu, underrun %d, buf %u frames          \n",
+                        "\rRX: %llu pkts, lost %llu, recovered %llu, underrun %d, buf %u (%u-%u) frames          \n",
                         (unsigned long long)st.total_packets_rx, (unsigned long long)lost,
-                        (unsigned long long)recovered, st.underruns, (unsigned)avail);
+                        (unsigned long long)recovered, st.underruns, buf_disp, buf_lo, buf_hi);
             }
         }
     }
