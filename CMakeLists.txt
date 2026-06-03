@@ -17,6 +17,7 @@ set(SOURCES
     src/plc.c
     src/fec.c
     src/rt_thread.c
+    src/drift_src.c
 )
 
 set(HEADERS
@@ -30,6 +31,7 @@ set(HEADERS
     src/rt_thread.h
     src/asio_backend.h
     src/jack_backend.h
+    src/drift_src.h
 )
 
 if(WIN32)

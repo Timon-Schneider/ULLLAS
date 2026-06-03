@@ -6,6 +6,7 @@
 #include "fec.h"
 #include "ringbuffer.h"
 #include "rt_thread.h"
+#include "drift_src.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -144,6 +145,14 @@ typedef struct {
     int      drift_comp_enabled;
     int      drift_tick;
 
+    /* Drift compensation via sample-rate conversion. */
+    DriftSrc        src;
+    volatile double src_ratio;
+    size_t          src_last_consumed;
+    double          buf_smooth;
+    int32_t        *src_buf;
+    size_t          src_buf_frames;
+
     /* Pre-allocated unpacking scratch (interleaved int32). Sized for the
      * largest single packet (MTU-driven). */
     int32_t *unpack_scratch;
@@ -188,6 +197,63 @@ static int receiver_callback(const int32_t *const *inputs, int32_t *const *outpu
             }
             return 0;
         }
+    }
+
+    if (st->drift_comp_enabled) {
+        {
+            size_t target = (size_t)st->jitter_target_frames * 2;
+            st->buf_smooth = st->buf_smooth * 0.9 + (double)avail * 0.1;
+            double norm_err = (st->buf_smooth - (double)target)
+                            / (double)st->buffer_size;
+            double rt = 1.0 - norm_err * 0.003;
+            if (rt > 1.002) rt = 1.002;
+            if (rt < 0.998) rt = 0.998;
+            st->src_ratio = st->src_ratio * 0.9 + rt * 0.1;
+            drift_src_set_ratio(&st->src, st->src_ratio);
+        }
+
+        /* Use the SRC's actual last consumption as the read predictor.
+         * This synchronises the ring‑buffer drain with the SRC's own
+         * fractional accumulator so the SRC FIFO never starves. */
+        size_t base = st->src_last_consumed;
+        if (base > (size_t)nframes + 1) base = (size_t)nframes + 1;
+        if (base < (size_t)nframes - 1) base = (size_t)nframes - 1;
+
+        /* Emergency: if the ring buffer is critically low, read one
+         * fewer frame than we produce so the buffer recovers. Also
+         * freeze the SRC ratio to avoid fighting the recovery. */
+        if (avail < (size_t)nframes + (size_t)DRIFT_SRC_TAPS) {
+            base = (size_t)nframes - 1;
+            st->src_ratio = 1.0;
+            drift_src_set_ratio(&st->src, 1.0);
+        }
+
+        size_t fifo_avail  = drift_src_avail(&st->src);
+        size_t needed      = base;
+
+        if (fifo_avail < (size_t)DRIFT_SRC_TAPS)
+            needed += (size_t)DRIFT_SRC_TAPS - fifo_avail;
+
+        if (needed > st->src_buf_frames)
+            needed = st->src_buf_frames;
+
+        if (needed > avail)
+            needed = avail;
+        if (needed == 0)
+            needed = 1;
+
+        size_t read = rb_read_interleaved(&st->rb, st->src_buf, needed);
+        if (read < needed) {
+            memset(st->src_buf + read * (size_t)st->channels, 0,
+                   (needed - read) * (size_t)st->channels * sizeof(int32_t));
+            st->underruns++;
+        }
+
+        drift_src_push(&st->src, st->src_buf, needed);
+
+        size_t consumed = drift_src_process(&st->src, outputs, (size_t)nframes);
+        st->src_last_consumed = consumed;
+        return 0;
     }
 
     size_t read = rb_read(&st->rb, outputs, (size_t)nframes);
@@ -283,7 +349,6 @@ static void rx_emit_packet(uint32_t seq, uint16_t num_samples, const uint8_t *pa
     }
     plc_observe_packet(&st->plc, st->unpack_scratch, (int)n);
 
-    size_t avail_before = rb_available_read_frames(&st->rb);
     rb_write_interleaved(&st->rb, st->unpack_scratch, n);
 
     if (st->cfg->verbose) {
@@ -294,20 +359,9 @@ static void rx_emit_packet(uint32_t seq, uint16_t num_samples, const uint8_t *pa
     st->last_emitted_seq = seq;
     st->have_last_seq    = 1;
 
-    if (st->drift_comp_enabled && ++st->drift_tick >= 5) {
-        st->drift_tick = 0;
-        size_t target = (size_t)st->jitter_target_frames;
-        size_t bs     = (size_t)st->buffer_size;
-        if (avail_before > target + bs * 3) {
-            rb_skip_read(&st->rb, 1);
-            st->total_drift_drops++;
-        } else if (avail_before > 0 && avail_before < bs && st->unpack_scratch_frames > 0) {
-            for (int ch = 0; ch < st->channels; ch++) {
-                st->unpack_scratch[ch] = st->plc.last_frame[ch];
-            }
-            rb_write_interleaved(&st->rb, st->unpack_scratch, 1);
-            st->total_drift_dups++;
-        }
+    if (st->drift_comp_enabled) {
+        /* Already handled in the audio callback — no-op here. */
+        (void)st;
     }
 }
 
@@ -490,6 +544,25 @@ static int run_receiver(Config *cfg) {
 
     plc_init(&st.plc, st.channels, (unsigned)st.sample_rate, cfg->plc ? 1 : 0);
 
+    if (st.drift_comp_enabled) {
+        drift_src_init(&st.src, st.channels);
+        st.src_ratio          = 1.0;
+        st.src_last_consumed  = (size_t)st.buffer_size;
+        st.buf_smooth         = (double)(st.jitter_target_frames * 2);
+        st.src_buf_frames     = 1024;
+        st.src_buf = (int32_t *)calloc(st.src_buf_frames * (size_t)st.channels, sizeof(int32_t));
+        if (!st.src_buf) {
+            fprintf(stderr, "Failed to allocate drift SRC buffer\n");
+            free(st.unpack_scratch);
+            st.audio->vtable->destroy(st.audio);
+            free(st.audio);
+            rb_destroy(&st.rb);
+            return -1;
+        }
+    } else {
+        st.src_buf   = NULL;
+    }
+
     if (st.fec_enabled) {
         size_t payload_size = expected_payload_bytes(st.channels, st.bit_depth, st.buffer_size);
         if (fec_rx_init(&st.fec, (int)cfg->fec_group_size, payload_size) != 0) {
@@ -570,12 +643,12 @@ static int run_receiver(Config *cfg) {
             uint64_t lost      = st.total_packets_lost;
             if (cfg->verbose) {
                 fprintf(stderr,
-                        "\rRX: %llu pkts, lost %llu, recovered %llu, dups %llu, reord %llu, drift-d/u %llu/%llu, "
+                        "\rRX: %llu pkts, lost %llu, recovered %llu, dups %llu, reord %llu, drift-ratio %.6f, "
                         "underrun %d, buf %u frames, peak %d          \n",
                         (unsigned long long)st.total_packets_rx, (unsigned long long)lost,
                         (unsigned long long)recovered, (unsigned long long)st.total_dups,
-                        (unsigned long long)st.total_reorders, (unsigned long long)st.total_drift_drops,
-                        (unsigned long long)st.total_drift_dups, st.underruns, (unsigned)avail, (int)st.peak_level);
+                        (unsigned long long)st.total_reorders, st.src_ratio,
+                        st.underruns, (unsigned)avail, (int)st.peak_level);
             } else {
                 fprintf(stderr,
                         "\rRX: %llu pkts, lost %llu, recovered %llu, underrun %d, buf %u frames          \n",
@@ -595,6 +668,8 @@ static int run_receiver(Config *cfg) {
     free(st.audio);
     udp_receiver_destroy(&st.rx);
     free(st.unpack_scratch);
+    free(st.src_buf);
+    drift_src_destroy(&st.src);
     rb_destroy(&st.rb);
     return 0;
 }
