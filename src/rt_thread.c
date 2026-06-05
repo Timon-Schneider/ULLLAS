@@ -91,6 +91,11 @@ int rt_lock_memory(void) {
         return -1;
     }
     return 0;
+#elif defined(__APPLE__)
+    /* macOS has no mlockall. THREAD_TIME_CONSTRAINT_POLICY (set above)
+     * already prevents the kernel from paging out real-time threads. */
+    (void)0;
+    return 0;
 #else
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         rt_log_warn_once("rt: mlockall failed (try ulimit -l unlimited or set RLIMIT_MEMLOCK)");
