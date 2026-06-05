@@ -145,7 +145,6 @@ typedef struct {
     uint32_t last_emitted_seq;
     int      have_last_seq;
     int      drift_comp_enabled;
-    int      drift_tick;
 
     /* Drift compensation via sample-rate conversion. */
     DriftSrc        src;
@@ -168,8 +167,6 @@ typedef struct {
     uint64_t total_dups;
     uint64_t total_reorders;
     uint64_t total_recovered;
-    uint64_t total_drift_drops;
-    uint64_t total_drift_dups;
     int      underruns;
     int32_t  peak_level;
 
@@ -379,11 +376,6 @@ static void rx_emit_packet(uint32_t seq, uint16_t num_samples, const uint8_t *pa
 
     st->last_emitted_seq = seq;
     st->have_last_seq    = 1;
-
-    if (st->drift_comp_enabled) {
-        /* Already handled in the audio callback — no-op here. */
-        (void)st;
-    }
 }
 
 /* ----------------------------------------------------------------------

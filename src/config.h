@@ -36,7 +36,7 @@ typedef struct {
      * deterministic and the user is in control. */
     bool plc;             /* packet loss concealment with sample-hold + fade */
     unsigned int fec_group_size; /* 0 = off; otherwise [2..16] data packets per parity */
-    bool drift_comp;      /* drop/insert single frames over time to track sender clock */
+    bool drift_comp;      /* variable-rate Lanczos SRC with PI controller to track sender clock */
 
     bool list_devices;
     bool verbose;

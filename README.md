@@ -4,7 +4,13 @@ Point-to-multipoint uncompressed audio streaming over LAN with ASIO (Windows), C
 
 ## Download and Run
 
-Pre-built binaries are available on the **[Releases](https://github.com/Timon-Schneider/ULLLAS/releases)** page.
+Pre-built binaries are available on the **[Releases](https://github.com/Timon-Schneider/ULLLAS/releases)** page, or use the direct links below:
+
+| Platform | File | Download |
+|---|---|---|
+| Windows | `ulllas.exe` | [Download](https://github.com/Timon-Schneider/ULLLAS/releases/latest/download/ulllas.exe) |
+| macOS | `ULLLAS.dmg` | [Download](https://github.com/Timon-Schneider/ULLLAS/releases/latest/download/ULLLAS.dmg) |
+| Linux | `ulllas` | [Download](https://github.com/Timon-Schneider/ULLLAS/releases/latest/download/ulllas) |
 
 ### Windows
 
@@ -132,7 +138,7 @@ ulllas recv --out-channels 0,1 --port 9000
 | `--jitter <packets>` | recv | `2` | Receiver-only: static jitter buffer size in packets (1–8). Ignored on sender |
 | `--plc` | recv | off | Packet loss concealment: hold the last frame briefly then fade to silence on loss. No added latency |
 | `--fec <N>` | both | off | XOR forward error correction: send a parity packet every `N` data packets. Receiver delays playback by one FEC group (`N+1` packets) to enable recovery. `N` in `[2..16]` |
-| `--drift-comp` | recv | off | Drop or duplicate one frame occasionally to track the sender's clock over long sessions |
+| `--drift-comp` | recv | off | Smoothly adjusts the sample rate via Lanczos SRC to track the sender's clock over long sessions. Adds ~1.4 ms latency |
 | `--list-devices` | both | — | List audio devices and exit |
 | `--verbose` | both | off | Show peak levels and full stats in status line |
 | `--help` / `-h` | both | — | Print usage |

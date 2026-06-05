@@ -70,12 +70,6 @@ size_t rb_read(RingBuffer *rb, int32_t *const *channels, size_t frames);
 size_t rb_write_interleaved(RingBuffer *rb, const int32_t *src, size_t frames);
 size_t rb_read_interleaved(RingBuffer *rb, int32_t *dst, size_t frames);
 
-/* Drift compensation primitive: drop the next `frames` from the read
- * side (consumer-side, but it's safe for the producer to call in our
- * usage because the receiver's network thread owns both ends of the
- * compensation operation). Returns frames actually skipped. */
-size_t rb_skip_read(RingBuffer *rb, size_t frames);
-
 void rb_reset(RingBuffer *rb);
 
 #ifdef __cplusplus
