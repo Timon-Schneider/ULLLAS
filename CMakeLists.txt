@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(ulllas VERSION 2.0.0 LANGUAGES C CXX)
+project(ulllas VERSION 2.0.1 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -87,7 +87,7 @@ if(APPLE)
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Info.plist"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.ulllas.audio"
         MACOSX_BUNDLE_BUNDLE_NAME "ULLLAS"
-        MACOSX_BUNDLE_BUNDLE_VERSION "2.0.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION "2.0.1"
     )
 endif()
 

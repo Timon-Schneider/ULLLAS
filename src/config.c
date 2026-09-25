@@ -55,7 +55,7 @@ static int parse_channels(const char *s, int *map, int max_ch) {
 
 void config_print_usage(const char *prog) {
     fprintf(stderr,
-            "ULLLAS - Ultra Low Latency LAN Audio Streamer v2.0.0\n\n"
+            "ULLLAS - Ultra Low Latency LAN Audio Streamer v2.0.1\n\n"
             "Usage: %s <mode> [options]\n\n"
             "Modes:\n"
             "  send     Capture local audio and stream to network\n"
