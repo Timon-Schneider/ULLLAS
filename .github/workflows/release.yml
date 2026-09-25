@@ -1,0 +1,114 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-make
+
+      - name: Build (static)
+        shell: msys2 {0}
+        run: |
+          cmake -G "MinGW Makefiles" -S . -B build
+          cmake --build build --parallel
+
+      - name: Stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/ulllas.exe dist/ulllas.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ulllas.exe
+          path: dist/ulllas.exe
+
+  linux:
+    # 22.04 for older glibc; binary stays compatible with Debian 12+.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libjack-jackd2-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build
+          cmake --build build --parallel
+
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp build/ulllas dist/ulllas
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ulllas-linux
+          path: dist/ulllas
+
+  macos:
+    # arm64 runner; cross-compiles the x86_64 slice too -> universal binary.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary (Intel + Apple Silicon)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+          cmake --build build --parallel
+          lipo -info build/ulllas.app/Contents/MacOS/ulllas
+
+      - name: Create DMG
+        run: |
+          mkdir dmg-staging
+          cp -R build/ulllas.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname ULLLAS -srcfolder dmg-staging \
+            -ov -format UDZO ULLLAS.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ULLLAS.dmg
+          path: ULLLAS.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ulllas.exe
+            dist/ulllas
+            dist/ULLLAS.dmg
