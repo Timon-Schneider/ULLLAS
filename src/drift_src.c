@@ -94,6 +94,13 @@ void drift_src_push(DriftSrc *s, const int32_t *interleaved, size_t frames)
     size_t   cap = s->mask + 1;
     size_t   w   = s->write_idx;
 
+    /* Belt-and-braces: never write past the read cursor even if the
+     * caller pushes more than the FIFO can hold. Excess (newest) frames
+     * are dropped. With correct accounting upstream this never trips. */
+    size_t space = (s->avail < cap) ? (cap - s->avail) : 0;
+    if (frames > space) frames = space;
+    if (frames == 0) return;
+
     size_t first = cap - w;
     if (first > frames) first = frames;
     memcpy(s->buf + w * (size_t)ch, interleaved, first * (size_t)ch * sizeof(int32_t));
@@ -118,10 +125,13 @@ static inline int32_t clamp32(double v)
 }
 
 size_t drift_src_process(DriftSrc *s,
-                         int32_t * const *planar_out, size_t out_frames)
+                         int32_t * const *planar_out, size_t out_frames,
+                         size_t *produced)
 {
     int    ch    = s->channels;
     double step  = 1.0 / s->ratio;
+
+    if (produced) *produced = 0;
 
     if (s->avail < (size_t)DRIFT_SRC_TAPS) {
         for (int c = 0; c < ch; c++)
@@ -130,10 +140,32 @@ size_t drift_src_process(DriftSrc *s,
         return 0;
     }
 
+    /* The taps reach DRIFT_SRC_TAPS/2-1 frames on either side of each
+     * output position and the block spans out_frames * step input
+     * frames, so a full block needs avail >= out_frames*step + TAPS.
+     * Only produce what the FIFO can actually serve and zero-fill the
+     * rest. Producing more would read stale frames past the write
+     * cursor and underflow avail (avail -= consumed), which previously
+     * corrupted the stream permanently after a single ring underrun. */
+    size_t allowed   = s->avail - (size_t)DRIFT_SRC_TAPS;
+    double max_out_d = ((double)allowed - s->read_frac) / step;
+    if (max_out_d < 0.0) max_out_d = 0.0;
+    size_t max_out   = (size_t)max_out_d;
+    if (max_out > out_frames) max_out = out_frames;
+
+    if (max_out < out_frames) {
+        for (int c = 0; c < ch; c++) {
+            memset(planar_out[c] + max_out, 0,
+                   (out_frames - max_out) * sizeof(int32_t));
+        }
+    }
+    if (produced) *produced = max_out;
+    if (max_out == 0) return 0;
+
     size_t stride   = (size_t)ch;
     int    leftmost = DRIFT_SRC_TAPS / 2 - 1;
 
-    for (size_t k = 0; k < out_frames; k++) {
+    for (size_t k = 0; k < max_out; k++) {
         double pos  = s->read_frac + (double)k * step;
         size_t ridx = (size_t)pos;
         double t    = pos - (double)ridx;
@@ -162,8 +194,9 @@ size_t drift_src_process(DriftSrc *s,
         }
     }
 
-    double advance  = s->read_frac + (double)out_frames * step;
+    double advance  = s->read_frac + (double)max_out * step;
     size_t consumed = (size_t)advance;
+    if (consumed > s->avail) consumed = s->avail;
     s->read_frac    = advance - (double)consumed;
     s->read_idx     = (s->read_idx + consumed) & s->mask;
     s->avail       -= consumed;

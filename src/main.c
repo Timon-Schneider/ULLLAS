@@ -145,6 +145,9 @@ typedef struct {
     uint32_t last_emitted_seq;
     int      have_last_seq;
     int      drift_comp_enabled;
+    /* Set by the network thread on sender restart; consumed by the
+     * audio callback (single-threaded with the SRC state). */
+    int      src_reset_pending;
 
     /* Drift compensation via sample-rate conversion. */
     DriftSrc        src;
@@ -168,6 +171,7 @@ typedef struct {
     uint64_t total_reorders;
     uint64_t total_recovered;
     int      underruns;
+    uint64_t src_starved;
     int32_t  peak_level;
 
     double buf_display;
@@ -209,6 +213,15 @@ static int receiver_callback(const int32_t *const *inputs, int32_t *const *outpu
     }
 
     if (st->drift_comp_enabled) {
+        if (st->src_reset_pending) {
+            drift_src_reset(&st->src);
+            st->src_ratio         = 1.0;
+            st->src_last_consumed = (size_t)st->buffer_size;
+            st->buf_smooth        = (double)st->jitter_target_frames;
+            st->buf_integral      = 0.0;
+            st->src_reset_pending = 0;
+        }
+
         {
             size_t target = (size_t)st->jitter_target_frames;
             st->buf_smooth = st->buf_smooth * 0.9 + (double)avail * 0.1;
@@ -262,15 +275,21 @@ static int receiver_callback(const int32_t *const *inputs, int32_t *const *outpu
 
         size_t read = rb_read_interleaved(&st->rb, st->src_buf, needed);
         if (read < needed) {
-            memset(st->src_buf + read * (size_t)st->channels, 0,
-                   (needed - read) * (size_t)st->channels * sizeof(int32_t));
             st->underruns++;
         }
 
-        drift_src_push(&st->src, st->src_buf, needed);
+        /* Push only the frames the ring actually delivered. Pushing the
+         * zero-padded block instead drained the SRC FIFO instantly on
+         * every starved callback (push 1, consume ~256) and injected
+         * silence into the middle of real audio. */
+        if (read > 0) {
+            drift_src_push(&st->src, st->src_buf, read);
+        }
 
-        size_t consumed = drift_src_process(&st->src, outputs, (size_t)nframes);
+        size_t produced = 0;
+        size_t consumed = drift_src_process(&st->src, outputs, (size_t)nframes, &produced);
         st->src_last_consumed = consumed;
+        if (produced < (size_t)nframes) st->src_starved++;
         return 0;
     }
 
@@ -312,6 +331,11 @@ static void rx_emit_packet(uint32_t seq, uint16_t num_samples, const uint8_t *pa
             st->last_emitted_seq = 0;
             rb_reset(&st->rb);
             st->started = 0;
+            /* The drift SRC cursor must be re-primed too, otherwise it
+             * keeps reading from a desynced position. Flag it and let
+             * the audio callback do the reset - the SRC state is not
+             * atomic and this runs on the network thread. */
+            st->src_reset_pending = st->drift_comp_enabled;
         }
     }
 
@@ -683,16 +707,18 @@ static int run_receiver(Config *cfg) {
             if (cfg->verbose) {
                 fprintf(stderr,
                         "\rRX: %llu pkts, lost %llu, recovered %llu, dups %llu, reord %llu, drift-ratio %.6f, "
-                        "underrun %d, buf %u (%u-%u) frames, peak %d          \n",
+                        "underrun %d, srcstarve %llu, buf %u (%u-%u) frames, peak %d          \n",
                         (unsigned long long)st.total_packets_rx, (unsigned long long)lost,
                         (unsigned long long)recovered, (unsigned long long)st.total_dups,
                         (unsigned long long)st.total_reorders, st.src_ratio,
-                        st.underruns, buf_disp, buf_lo, buf_hi, (int)st.peak_level);
+                        st.underruns, (unsigned long long)st.src_starved, buf_disp, buf_lo, buf_hi, (int)st.peak_level);
             } else {
                 fprintf(stderr,
-                        "\rRX: %llu pkts, lost %llu, recovered %llu, underrun %d, buf %u (%u-%u) frames          \n",
+                        "\rRX: %llu pkts, lost %llu, recovered %llu, underrun %d, srcstarve %llu, buf %u (%u-%u) "
+                        "frames          \n",
                         (unsigned long long)st.total_packets_rx, (unsigned long long)lost,
-                        (unsigned long long)recovered, st.underruns, buf_disp, buf_lo, buf_hi);
+                        (unsigned long long)recovered, st.underruns, (unsigned long long)st.src_starved, buf_disp,
+                        buf_lo, buf_hi);
             }
         }
     }

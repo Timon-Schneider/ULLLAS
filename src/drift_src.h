@@ -40,10 +40,15 @@ void   drift_src_push(DriftSrc *s, const int32_t *interleaved, size_t frames);
 /* Available frames in FIFO for reading. */
 size_t drift_src_avail(const DriftSrc *s);
 
-/* Produce `out_frames` of planar output, consuming from the internal
- * FIFO at the variable ratio. Returns frames actually produced. */
+/* Produce up to `out_frames` of planar output, consuming from the
+ * internal FIFO at the variable ratio. Returns the number of input
+ * frames consumed. The FIFO is never read past its valid data: if it
+ * holds less than a full block plus filter taps, the tail of the
+ * output is zero-filled and *produced reports how many frames contain
+ * real audio. */
 size_t drift_src_process(DriftSrc *s,
-                         int32_t * const *planar_out, size_t out_frames);
+                         int32_t * const *planar_out, size_t out_frames,
+                         size_t *produced);
 
 #ifdef __cplusplus
 }
