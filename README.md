@@ -21,7 +21,9 @@ Pre-built binaries are available on the **[Releases](https://github.com/Timon-Sc
    .\ulllas.exe send --list-devices
    ```
 
-### macOS (Intel)
+### macOS (Intel / Apple Silicon)
+
+The `.dmg` ships a **universal binary** — runs natively on both Intel Macs and Apple Silicon (M1/M2/M3/M4).
 
 > **Note:** The app is **not signed**, so macOS will block it on first launch.
 
